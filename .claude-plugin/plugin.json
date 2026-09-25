@@ -1,0 +1,11 @@
+{
+  "name": "order-sizer",
+  "version": "2.0.0",
+  "description": "Takes a position weight expressed as a percentage of a portfolio and computes the corresponding quantity for a portfolio of a different size. Arithmetic only: it forms no view on the position, executes nothing, and every order waits for approval in the user's own broker.",
+  "keywords": [
+    "position-sizing",
+    "portfolio",
+    "arithmetic",
+    "ibkr"
+  ]
+}
