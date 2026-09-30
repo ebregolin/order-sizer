@@ -70,6 +70,48 @@ PCT_BUILTIN = {9, 10}
 DATE_BUILTIN = set(range(14, 23)) | {27, 30, 36, 45, 46, 47, 50, 57}
 
 
+def local_stamp(iso, tz):
+    """UTC instant -> the same instant written in the reader's own time.
+
+    Returns e.g. "2026-09-29 12:21 CEST (UTC+2)". Done here rather than in the
+    report so that the change of clock in October is handled by the zone database
+    instead of by arithmetic someone has to remember.
+    """
+    if not iso or not tz:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        d = datetime.fromisoformat(iso).astimezone(ZoneInfo(tz))
+    except Exception:
+        return None
+    off = d.utcoffset() or timedelta(0)
+    mins = int(off.total_seconds() // 60)
+    sign = "+" if mins >= 0 else "-"
+    hh, mm = divmod(abs(mins), 60)
+    off_s = f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")
+    name = d.tzname() or ""
+    return f"{d.strftime('%Y-%m-%d %H:%M')} {name} ({off_s})".replace("  ", " ")
+
+
+def declares_utc(path):
+    """Does the workbook say, in its own words, that its clock is UTC?
+
+    The reader has always assumed it. Once a source states the convention, a source
+    that stops stating it is a source that may have changed it — and a silent change
+    of time zone moves every expiry by an hour or two without anything failing.
+    Absence is reported, never treated as an error: most workbooks say nothing.
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            for n in ("xl/sharedStrings.xml",):
+                if n in z.namelist():
+                    if re.search(rb"\bUTC\b", z.read(n)):
+                        return True
+    except Exception:
+        return None
+    return False
+
+
 def read_styles(z):
     """Map cell-style index -> ('pct' | 'date' | None).
 
@@ -190,6 +232,7 @@ def key(name):
 
 TRADES_SHEET = ("operazioni", "trades")
 INSTR_SHEET = ("strumenti", "instruments")
+POS_SHEET = ("posizioni", "positions")
 
 
 def pick(sheets, names):
@@ -224,6 +267,10 @@ def main():
                     help="Accepted for backward compatibility and ignored: every "
                          "reader receives every published trade.")
     ap.add_argument("--fx", action="append", default=[], metavar="CCY=RATE")
+    ap.add_argument("--tz", default=None, metavar="ZONE",
+                    help="Reader's own time zone (e.g. Europe/Rome). When given, every "
+                         "timestamp also carries a preformatted local string with its "
+                         "offset. The file is UTC; people are not.")
     ap.add_argument("--out", default="-")
     a = ap.parse_args()
 
@@ -418,8 +465,53 @@ def main():
         t["expires_at"] = (base + timedelta(hours=t.pop("hours"))).isoformat(timespec="seconds")
     trades = [t for t in trades if not t.pop("_drop", False)]
 
+    # ---- the source's own book ----------------------------------------------
+    # Published in the workbook and, until now, never read by this side. Without it
+    # a reader has no way of knowing that their holdings have drifted from the
+    # source's: every failure on the reading side — a missed leg, a partial fill, a
+    # rejected order — is invisible and cumulative. Reported, never acted on.
+    source_positions, pos_note = [], None
+    rows_pos, _ = pick(sheets, POS_SHEET)
+    if rows_pos is None:
+        pos_note = "The source's workbook has no Positions sheet: holdings cannot be compared."
+    else:
+        started = False
+        for r in rows_pos:
+            name, pct = get(r, 0), get(r, 3)
+            if name is None or pct is None:
+                if started:
+                    break            # the table has ended
+                continue
+            try:
+                w = float(str(pct).replace("%", "").replace(",", ".").strip())
+            except ValueError:
+                continue             # still in the header block
+            started = True
+            ent = reg.get(key(str(name)))
+            source_positions.append({
+                "instrument": str(name).strip(),
+                "asset_class": str(get(r, 1) or "").strip(),
+                "direction": str(get(r, 2) or "").strip(),
+                "pct_nav": round(w * 100 if abs(w) <= 1 and "%" in str(pct) else w, 4),
+                "contract_id_ex": (ent or {}).get("contract_id_ex"),
+                "multiplier": (ent or {}).get("multiplier"),
+                "currency": (ent or {}).get("currency"),
+            })
+        if not source_positions:
+            pos_note = "The Positions sheet is present but empty."
+
+    if a.tz:
+        for t in trades:
+            t["published_at_local"] = local_stamp(t.get("published_at"), a.tz)
+            t["expires_at_local"] = local_stamp(t.get("expires_at"), a.tz)
+
     signal = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
+        "timezone": a.tz,
+        "source_declares_utc": declares_utc(a.file),
+        "source_positions": source_positions,
+        "source_positions_note": pos_note,
+        "fx_rates": fx,
         "source_file": os.path.basename(a.file),
         "read_at": now.isoformat(timespec="seconds"),
         "audience": a.audience,

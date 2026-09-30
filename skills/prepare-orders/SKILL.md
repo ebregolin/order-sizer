@@ -9,7 +9,7 @@ description: >
   ordini", "controlla la fonte", "aggiorna il portafoglio", "¿hay operaciones
   nuevas?", "gibt es neue Trades?" — and on a scheduled check.
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # Prepare orders
@@ -78,8 +78,20 @@ it came from, and ask what they want to do.
 
 **State the version when you first act in a session.** This plugin is installed from
 a file and has no update channel, so a user can be running an old build without any
-sign of it. Say "order-sizer 2.0.0" once, early. A tester comparing notes needs to
+sign of it. Say "order-sizer 2.1.0" once, early. A tester comparing notes needs to
 know which build produced them.
+
+**Whole units only. Never a fractional quantity.** An instruction is prepared now
+and submitted by a person later, possibly outside regular trading hours, when no
+venue accepts fractions. Which side of that line the submission falls on cannot be
+known when the order is built. `mirror.py` rounds; do not undo it and do not offer a
+fractional alternative.
+
+**Never prepare an order that contradicts what the source published.** If reaching
+the published weight would mean buying while the source was selling, the engine
+returns SKIP and explains why. Relay that. Every instruction this tool creates must
+correspond to a row the source actually published, with its timestamp and its
+rationale — that correspondence is the whole defence of this design.
 
 **Reply in the language the user writes to you in.** Everything in this plugin is in English: these instructions, the engine's messages, the source's spreadsheet. That is the working language of the code, not a statement about who the reader is.
 
@@ -110,7 +122,7 @@ A source the reader can open directly, on their own machine or a synced folder:
 
 ```json
 {"signal_source": {"type": "local", "path": "<what they answered>"},
- "language": "en", "source_contact": ""}
+ "language": "en", "source_contact": "", "timezone": "<IANA zone, e.g. Europe/Rome>"}
 ```
 
 A source published to a git repository, which is how an automated check reaches it
@@ -122,7 +134,7 @@ the reader belongs here too:
                    "repo": "<repository address>",
                    "path": "<file name inside it>",
                    "key":  "<the key the source gave the reader>"},
- "language": "en", "source_contact": ""}
+ "language": "en", "source_contact": "", "timezone": "<IANA zone, e.g. Europe/Rome>"}
 ```
 
 **If the run's own request already carries those coordinates — a repository, a file
@@ -136,6 +148,13 @@ On every later run, read that file without asking. Older configurations hold a p
 `signal_file` path instead; that still works and means a local source. If the
 configured source has disappeared, say so plainly and offer to set a new one — never
 guess a replacement or silently proceed with no signal source.
+
+**Ask for the time zone on the first run**, alongside the source coordinates, and
+store it as an IANA name (`Europe/Rome`, `America/New_York`). Every later run needs
+it, including the automatic ones, which have nobody to ask. If it is genuinely
+unknown, omit it and show every time as UTC, labelled UTC — never infer a zone from
+a language, a market or a name: an hour's error on a signal that lives twenty-four
+hours is a real error.
 
 **The source's key is a credential.** Never print it, never quote it back in a
 report, and never write it anywhere but this config file.
@@ -166,8 +185,20 @@ read its numbers yourself** — that would put a language model in the arithmeti
 
 ```
 python3 "<skill-dir>/scripts/read_sheet.py" --file /tmp/order-sizer/source.xlsx \
-  --fx USD=<rate> --out signals.json
+  --fx USD=<rate> --tz <the reader's zone from the config> --out signals.json
 ```
+
+**Times.** The workbook's clock is UTC. With `--tz` the reader also gets each
+timestamp preformatted in their own zone, with the offset spelled out —
+`2026-09-29 12:21 CEST (UTC+2)`. **Show people the local string; never show them a
+bare UTC time as though it were their own, and never convert by hand.** The zone
+database handles the October and March clock changes; arithmetic does not.
+
+The output carries `source_declares_utc`. If it is false, say so once, plainly —
+*"the source's file no longer states which time zone its times are in; they are
+being read as UTC"* — and carry on. A source that silently changes its convention
+moves every expiry by an hour or two with nothing failing, and this is the only
+place that would notice.
 
 **Always quote the paths.** The source chooses the file's name and may rename it; a
 single space in it turns one argument into two and the reader reports a file that
@@ -256,8 +287,19 @@ the matching close would silently create the opposite position.
 ```
 python3 <skill-dir>/scripts/mirror.py \
   --signals <signal-file> --nav <net_liquidation> --prices <prices.json> \
-  --positions <positions.json>
+  --positions <positions.json> --min-pct 0.75
 ```
+
+**`--positions` is not optional here.** The engine sizes each order from the weight
+the source published to the weight the reader actually holds — their portfolio is
+the only memory this tool has. Without it every still-valid signal is prepared again
+on every run, and a reader who has already acted is handed the same trade twice.
+
+`--min-pct` is the smallest gap worth an order, in percentage points of the
+portfolio. Below it nothing is prepared and the reason is reported: a reader who has
+already executed, or whose weights slipped because they moved cash, should not be
+handed an order whose commission exceeds what it corrects. The default is 0.75; take
+it from the reader's config if they have set their own.
 
 `prices.json` maps `contract_id_ex` to the current price. The script returns, for
 each trade: side, quantity, limit price, an `action` of OK / WARN / BLOCK / SKIP,
@@ -284,6 +326,14 @@ user it is there** — deleting somebody's own order is far worse than leaving a
 one they can cancel themselves. Note also that IBKR **recycles instruction ids**, so
 never treat an id alone as identifying anything.
 
+**Never create an instruction that duplicates one already pending.** Before
+creating anything, compare what the engine returned with what `get_order_instructions`
+just listed: same contract, same side, a quantity within a unit or two. If it is
+already there, leave it and tell the reader it is waiting — do not stack a second
+one. The engine's weight check catches the reader who has already *executed*; this
+catches the one who has not yet pressed send. Two orders where the source published
+one is the worst failure this tool has, because the reader trusts it.
+
 ### 5. Create the instructions
 
 For each result with action OK or WARN, call `create_order_instruction` with the
@@ -307,13 +357,51 @@ the engine said. Never fill a gap with an assumption.
 When a result carries `adjustment_note`, state it plainly: the quantity was reduced
 because the user holds less than the source's reduction implies.
 
-### 6. Explain, then hand over
+**State the cost against the funds the broker says are available.** The engine
+returns `orders_notional_account_ccy`, the notional of everything it prepared, in
+the account's currency; the account summary already gave you `available_funds`. Put
+the two side by side in one line. A reader about to approve several orders at once —
+most of all where the source's book carries futures, whose notional runs to
+multiples of capital — is entitled to see what they consume before they press send,
+not after the broker rejects them.
+
+### 6. The drift report — how far the reader is from the source's book
+
+```
+python3 <skill-dir>/scripts/drift.py --signals <signal-file> \
+  --positions <positions.json> --prices <prices.json> --nav <net_liquidation> \
+  --min-pct 0.75
+```
+
+Every instruction here comes from a published row, and nothing is prepared without
+one. The consequence is that when a reader misses a leg — asleep, partly filled,
+order rejected, instrument refused by their broker — nothing corrects it until the
+source happens to trade that name again. Until then they believe they are tracking
+the source and they are not. This report is the only thing that tells them.
+
+**It prepares nothing and suggests nothing.** Give the differences as differences:
+*"the source's book shows SGLD at 5.6%, you hold 7.6%"*. No "you should", no offer to
+close the gap, no order. If they ask what to do about it, that is a decision about
+their own portfolio and it is theirs — the same line as everywhere else in this
+skill.
+
+Say plainly that the source's book is a snapshot refreshed by hand, and give its
+date: a stale comparison presented as current is worse than none.
+
+**When to show it.** On any run that prepared something; on the day's first
+scheduled run in the reader's own time zone; and whenever they ask. Not on all
+seventeen runs of a quiet day — a report nobody reads is a report that hides the one
+that mattered.
+
+### 7. Explain, then hand over
 
 Present each prepared instruction in plain language, in whatever language the user
 writes to you. Lead with what the source published, then the proportional equivalent. For every one, state:
 
 - what the source published
 - what the instrument is, in ordinary words — not the exchange code
+- **every time in the reader's own zone**, with the offset shown, exactly as
+  `read_sheet.py` preformatted it — publication, expiry, and the time of any quote
 - **the horizon the source attached to the view**, if present: a trade meant for days
   and one meant for a year are different propositions, and the user is entitled to
   know which they are being shown

@@ -9,19 +9,42 @@ who approves the orders.
 
 ## The prompt
 
-In Cowork, ask for a scheduled task at whatever interval suits you, with this text.
-Replace everything in angle brackets with your own coordinates and leave the rest as it
-is written.
+In Cowork, ask for a scheduled task with this text. Replace everything in angle
+brackets with your own coordinates and leave the rest as it is written.
+
+**A cadence that works, if you want one to start from:** every hour **at minute 55**,
+from an hour before your first market opens until an hour after your last one closes,
+on the days those markets trade — and, if your source trades across time zones,
+something lighter at weekends, every six hours. Set all of it in **your own local
+time**, not UTC.
+
+Minute 55 rather than on the hour for two reasons: scheduled tasks everywhere fire at
+:00, and a check that lands a few minutes before the hour gives you the result while
+you still have time to act on it rather than just after you have looked away.
+
+How often is a judgement, not a rule. A source that publishes two or three times a
+week does not need seventeen checks a day; a source that trades intraday does. What
+actually protects you is not frequency — signals stay valid for hours — but
+regularity.
 
 ```
-Check the source and prepare the orders: use the order-sizer plugin's
-`prepare-orders` skill and follow its procedure to the letter.
+Check whether my research source has published anything new and, if it has, work out
+what the published weights mean for the size of my own account and leave the
+resulting order instructions in my broker for me to look at. Use the order-sizer
+plugin's `prepare-orders` skill and follow its procedure to the letter.
+
+To be explicit about what this does and does not do: nothing is sent to the market.
+The skill can only PREPARE an instruction, which then sits in my Interactive Brokers
+app until I open it and either approve it or reject it, one by one. That limit is
+imposed by the broker, not by this prompt, and it is not to be worked around: if any
+step here seems to require transmitting an order, stop and tell me instead.
 
 Source to configure, without asking anyone:
 - repository: <the address your source gave you>
 - file: <the file name your source gave you>
 - key: <your key, if your source publishes an encrypted file - delete this line otherwise>
 - language: en
+- time zone: <your own, as an IANA name, e.g. Europe/Rome or America/New_York>
 - source contact: <where you can reach your source, if it gave you an address - otherwise leave empty>
 
 This is an automated run and nobody is watching. Ask no questions, never replace a
@@ -34,6 +57,17 @@ timestamp of the last quote available, rather than passing it off as current.
 
 Report compactly. If there is nothing new, two lines are enough.
 ```
+
+## Set the times in your own local time
+
+Give the schedule in the time you live in, not in UTC. Then a check you set for 8am
+stays at 8am when the clocks change in March and October, instead of drifting an
+hour twice a year.
+
+The source's file is written in UTC — that is deliberate, it is the one clock that
+does not move — and the plugin converts every time it shows you into yours, with the
+offset spelled out, so you never have to do the arithmetic. That is what the time
+zone line above is for.
 
 ## The coordinates
 
@@ -58,6 +92,14 @@ not, check by hand, or use a source that publishes in the clear.
 Three of those sentences are not padding. They are the reason an unattended run is
 acceptable at all:
 
+- **It says what the run may and may not do, in the first paragraph.** An instruction
+  that opens with "prepare the orders" reads, to anyone and to any assistant, like a
+  request to trade — and a request to trade on a schedule, unattended, is one that
+  deserves to be refused. It is also not what happens: the skill can only leave an
+  instruction in your broker, and Interactive Brokers will not move it until you
+  approve it yourself. Saying so plainly is not decoration. It is the difference
+  between a prompt that describes what it really does and one that appears to ask for
+  something dangerous.
 - **Ask no questions.** There is nobody to answer, and a run waiting for an answer is a
   run that did nothing.
 - **Never estimate a missing figure.** A number invented to fill a hole reaches the

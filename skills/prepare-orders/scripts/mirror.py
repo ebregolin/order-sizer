@@ -240,7 +240,7 @@ def build_message(action, slip_warn, dev_warn, dev_pp, dev_rel, cost_nav, fillab
     return " ".join(parts)
 
 
-def mirror_one(t, nav, price_now, held=None):
+def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
     """One published position -> one user instruction.
 
     price_now may be None. Some accounts have no live data subscription for some
@@ -265,7 +265,52 @@ def mirror_one(t, nav, price_now, held=None):
         if not ref or not mult:
             return {"action": "ERROR", "desc": desc0,
                     "message": "Incomplete signal: price or multiplier missing."}
-        delta_pct = pa - pb
+        published_delta = pa - pb
+        # Size to the published WEIGHT, measured from where this reader actually is
+        # — not by replaying the source's delta blindly. A reader who missed the
+        # opening leg, was half filled, or had an order rejected would otherwise
+        # carry that gap for ever, and one who already acted would be handed the
+        # same trade again on the next run. Their own holding is the memory this
+        # tool has no other way of keeping.
+        #
+        # The current weight is measured at the PUBLICATION price, not the live one,
+        # so that a price move between publication and check cannot by itself create
+        # or cancel an order. Publications move this tool; prices never do.
+        if held is not None:
+            current_pct = held * ref * mult / (nav * fx) * 100.0
+        else:
+            current_pct = pb
+        gap = pa - current_pct
+
+        if published_delta == 0:
+            return {"action": "SKIP", "desc": desc0, "current_pct": round(current_pct, 2),
+                    "message": "The source's weight did not change."}
+
+        # Direction lock. The target arithmetic can point the opposite way to the
+        # trade that was published — a reader sitting at zero when the source TRIMS
+        # a position would be told to buy it. Never prepare an order that
+        # contradicts the register: every instruction must correspond to something
+        # the source actually published.
+        if gap == 0 or (gap > 0) != (published_delta > 0):
+            return {"action": "SKIP", "desc": desc0,
+                    "current_pct": round(current_pct, 2), "target_pct": round(pa, 2),
+                    "published_delta_pct": round(published_delta, 2),
+                    "message": "Your holding is on the other side of this trade: the "
+                               "source " + ("increased" if published_delta > 0 else "reduced")
+                               + f" this position to {pa:g}% and you hold about "
+                               f"{current_pct:.2f}%. Closing that gap would mean trading "
+                               "against what was published, so nothing was prepared."}
+
+        if abs(gap) < min_pct:
+            return {"action": "SKIP", "desc": desc0,
+                    "current_pct": round(current_pct, 2), "target_pct": round(pa, 2),
+                    "gap_pct": round(gap, 2),
+                    "message": f"You already hold about {current_pct:.2f}% against the "
+                               f"{pa:g}% published — a gap of {abs(gap):.2f}%, below the "
+                               f"{min_pct:g}% minimum. No order prepared: the commission "
+                               "would cost more than the difference is worth."}
+
+        delta_pct = gap
         raw = (delta_pct / 100.0) * nav * fx / (ref * mult)
         scale = None
     else:
@@ -279,7 +324,14 @@ def mirror_one(t, nav, price_now, held=None):
         raw = t["delta_qty"] * scale
         delta_pct = None
 
-    qty = round(raw, 4) if t.get("divisible") else round_half_away(raw)
+    # Whole units, always. An instruction is prepared now and submitted by a human
+    # later — possibly outside regular trading hours, when no venue accepts a
+    # fractional order. Whether the moment of submission is inside those hours
+    # cannot be known when the order is built, so a fractional quantity is a bet on
+    # when the reader presses send. That bet was losing: orders reached the broker
+    # with no quantity at all. The Fractionable column stays in the source's sheet —
+    # it is still true about the instrument — it simply no longer sizes anything.
+    qty = round_half_away(raw)
 
     desc = desc0
     if qty == 0:
@@ -322,7 +374,7 @@ def mirror_one(t, nav, price_now, held=None):
                                "order prepared, so as not to open the opposite one."}
         if have < qty:
             note = (f"Reduced from {qty:g} to {have:g}: that is what you actually hold.")
-            qty = round(have, 4) if t.get("divisible") else int(have)
+            qty = int(have)
 
     if not ref:
         return {"action": "ERROR", "desc": desc,
@@ -386,6 +438,9 @@ def mirror_one(t, nav, price_now, held=None):
         "time_in_force": "DAY",
         "scale": round(scale, 4) if scale else None,
         "delta_pct_portafoglio": round(delta_pct, 3) if delta_pct is not None else None,
+        "published_delta_pct": round(pa - pb, 3) if (pa is not None and pb is not None) else None,
+        "current_pct": round(current_pct, 2) if pb is not None and pa is not None else None,
+        "target_pct": round(pa, 2) if pa is not None else None,
         "raw_qty": round(raw, 3),
         "rounding_dev_pp": round(dev_pp, 2),        # percentage points of portfolio
         "rounding_dev_rel_pct": round(dev_rel, 2),  # % of the published position
@@ -413,6 +468,10 @@ def main():
     ap.add_argument("--nav", required=True, type=float)
     ap.add_argument("--prices", required=True,
                     help="JSON mapping contract_id_ex -> current price")
+    ap.add_argument("--min-pct", type=float, default=0.75,
+                    help="Smallest gap, in percentage points of the portfolio, worth "
+                         "an order. Below it nothing is prepared and the reason is "
+                         "reported. Default 0.75.")
     ap.add_argument("--positions", default=None,
                     help="JSON mapping contract_id_ex -> quantity currently held. "
                          "Strongly recommended: without it, reductions cannot be "
@@ -434,6 +493,10 @@ def main():
 
     now = datetime.now(timezone.utc)
     results, expired, bad = [], [], []
+    # Kept so the total notional of the prepared set can be stated back in the
+    # account's own currency: a reader about to approve five orders should be told
+    # what they cost against the funds the broker says are available.
+    sig_mult, sig_fx = {}, {}
 
     for t in sig["trades"]:
         if not isinstance(t, dict):
@@ -466,7 +529,9 @@ def main():
             # naturally writes {}. Treating a missing key as "unknown" left the
             # guard inert in exactly the case it exists for: absent means ZERO.
             held = held_map.get(cid, 0) if held_map is not None else None
-            results.append(mirror_one(t, a.nav, price_now, held))
+            sig_mult[cid] = t.get("multiplier") or 1
+            sig_fx[cid] = t.get("fx") or 1
+            results.append(mirror_one(t, a.nav, price_now, held, a.min_pct))
         except (KeyError, TypeError, ValueError) as e:
             bad.append(f"{clean(t.get('desc'))}: incomplete data ({e}) — discarded")
 
@@ -475,6 +540,11 @@ def main():
         "user_nav": a.nav,
         "positions_checked": held_map is not None,
         "signal_published_at": sig.get("published_at"),
+        "min_pct": a.min_pct,
+        "orders_notional_account_ccy": round(sum(
+            r["quantity"] * r["signal_price"] * (sig_mult.get(r["contract_id_ex"]) or 1)
+            / (sig_fx.get(r["contract_id_ex"]) or 1)
+            for r in results if r["action"] in ("OK", "WARN")), 2),
         "all_skipped": bool(results) and all(r["action"] == "SKIP" for r in results),
         "to_create": [r for r in results if r["action"] in ("OK", "WARN")],
         "blocked": [r for r in results if r["action"] in ("BLOCK", "ERROR")],

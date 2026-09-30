@@ -21,6 +21,22 @@ The rest of this repository is the same plugin unpacked, so that anyone who want
 read the code before installing it can do so. `order-sizer.plugin` is built from
 exactly those files.
 
+## Two separate things
+
+Research and this tool are not the same product and are not sold together.
+
+Research is a subscription: somebody publishes what they are doing and why, under
+whatever obligations apply to them. **This plugin is free, open source and separate.**
+It works with any source that publishes its positions in the format `read_sheet.py`
+reads — the format exists because the market-abuse rules require a recommendation to
+be recorded and disseminated in a documented way, and any source meeting that
+standard can be used here. The author of this plugin publishes research himself and
+uses it on his own; that is a coincidence of authorship, not a bundle.
+
+If you are reading this because someone sent you their research: what you pay for is
+theirs. This is a calculator, you owe nobody anything for it, and you can point it
+somewhere else tomorrow.
+
 ## What it is
 
 Three Python files and a skill file, for use with an AI assistant.
@@ -30,6 +46,7 @@ Three Python files and a skill file, for use with an AI assistant.
 | `fetch_source.py` | Retrieves a file from a local path or from a git repository the user configures. Decrypts it if the user supplies a key. |
 | `read_sheet.py` | Reads instrument, weight and price from that spreadsheet. |
 | `mirror.py` | Computes the quantity, the rounding and a limit price. |
+| `drift.py` | Compares what the user holds with the book the source published, and prints the differences. Prepares nothing. |
 | `SKILL.md` | Instructions for the assistant: how to run the three scripts and what to do with what they return. |
 
 The Python has no required third-party dependencies, no obfuscation and no dynamic
@@ -63,6 +80,16 @@ This matters, so it is stated exactly:
   configuration, and may call `openssl` to decrypt what it downloaded. That host sees
   the request as any website would.
 - **It does not choose the source**, and expresses no opinion about it.
+- **It never trades because prices moved, or because money came in or out.** The
+  only thing that can cause an order to be prepared is a new position published by
+  the source, inside its validity. Nothing else — not a rally, not a deposit, not a
+  withdrawal, not the passing of a day.
+- **It does not open positions retroactively.** A user who starts after the source
+  took a position does not receive that position: the tool acts on what is published
+  from the moment it is configured, not on what was published before. What is
+  already in the portfolio, and how the portfolio came to look the way it does, is
+  the user's own affair. `drift.py` will show how the two books differ; what to do
+  about it is a decision nobody can take for them.
 
 ## Example usage
 
