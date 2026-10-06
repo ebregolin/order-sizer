@@ -9,7 +9,7 @@ description: >
   ordini", "controlla la fonte", "aggiorna il portafoglio", "¿hay operaciones
   nuevas?", "gibt es neue Trades?" — and on a scheduled check.
 metadata:
-  version: "2.1.0"
+  version: "2.3.0"
 ---
 
 # Prepare orders
@@ -78,8 +78,35 @@ it came from, and ask what they want to do.
 
 **State the version when you first act in a session.** This plugin is installed from
 a file and has no update channel, so a user can be running an old build without any
-sign of it. Say "order-sizer 2.1.0" once, early. A tester comparing notes needs to
+sign of it. Say "order-sizer 2.3.0" once, early. A tester comparing notes needs to
 know which build produced them.
+
+**Time in force is DAY, or OND where the engine says so. Never GTC, never anything
+else.** `mirror.py` decides and returns the value; send it verbatim and never
+substitute one. DAY dies at that session's close and OND lives about two sessions,
+so neither can sit in the market indefinitely against a signal the source has moved
+on from. GTC can, and the broker connector **has no cancel** — an order left working
+is one nobody can retract, and a reader who does not check their app would never
+know. These bounds are what limit the damage any single run can do.
+
+**Never send OND on your own judgement.** The engine sends it only on positive
+evidence that an extended session is running for that instrument right now. Tested
+on 6 October 2026: `create_order_instruction` **accepted OND on an LSE stock**,
+which has no overnight session at all — stored as `tif: "OND"` with no rejection and
+no warning. Nothing catches a wrong guess, so "try OND and fall back" is not
+available. Evidence, or DAY.
+
+**Never prepare an order while the venue is genuinely closed** — no quote, no recent
+prints, `last.is_close` true. Extended-hours trading is *not* closed: a US stock in
+pre-market reports a live two-sided quote and `is_close: false`, and an order there
+is prepared normally. The scheduled check runs every hour, so a dead market costs
+nothing: the run that finds it trading prepares the order against a live price.
+
+**Never make the reader responsible for a setting.** Where the broker's app offers an
+"outside regular trading hours" option the engine says so in the order's note,
+because this connector cannot write that field. It is information, never a step: if
+the reader ignores it the order simply waits for the regular session. Never present
+it as something they must do for the order to be safe.
 
 **Whole units only. Never a fractional quantity.** An instruction is prepared now
 and submitted by a person later, possibly outside regular trading hours, when no
@@ -263,10 +290,29 @@ skipping the cleanup on a quiet day is exactly when the stale instruction surviv
 ### 2. Gather the user's state
 
 - `get_account_summary` → `net_liquidation` (the user's NAV, in account currency)
-- `get_account_positions` → current holdings
-- `get_price_snapshot` for each signalled contract → the current market price
+  **and `available_funds`.** One call, both numbers — `available_funds` was being
+  discarded until now, and it is the only thing standing between a reader who
+  approves every order without reading and a levered portfolio they never chose.
+- `get_account_positions` → current holdings **and each holding's `market_value`**
+- `get_account_orders` → orders already working at the broker
+- `get_price_snapshot` for each signalled contract, requesting at least
+  `["last", "bid_ask"]` → the current price **and `last.is_close`**
+- `get_price_history` for each signalled contract, `step=ONE_DAY`,
+  `period=ONE_WEEK` → how many sessions the venue has completed since publication
 
 Get a fresh price for every instrument in the signal where one is available.
+
+**`last.is_close` is how this skill knows whether a venue is trading.** `true` means
+the last print is the session's closing price, i.e. the venue is shut. Do not use
+`top_status` for this — it reports REALTIME for a closed contract as happily as for
+an open one, so it answers a different question. A one-sided or empty `bid_ask` is a
+second sign the instrument cannot currently be traded.
+
+**Count sessions by comparing the daily bars to the publication timestamp.** The
+number of bars whose date falls strictly after the trade's publication, excluding a
+bar for a session still in progress, is `sessions_since_publication`. Zero means the
+venue has not yet given the reader a single chance to trade since the source
+published — which is what keeps a Friday evening signal alive until Monday.
 
 **If `get_price_snapshot` returns nothing for a contract, omit it from prices.json
 and carry on — do not drop the trade.** Some accounts have no live data for CME
@@ -282,12 +328,62 @@ cannot tell whether a reduction is closing something the user owns or opening a 
 they never intended — if an earlier opening order was skipped, expired or rejected,
 the matching close would silently create the opposite position.
 
+Then write `market.json`, keyed by the same `contract_id_ex`, with whatever of these
+is known for each contract:
+
+```json
+{
+  "158725708": {
+    "session_open": false,
+    "asset_class": "STK",
+    "market_value": 33710.0,
+    "working_qty": 0,
+    "working_age_hours": null,
+    "sessions_since_publication": 0,
+    "desc": "SMT @LSE"
+  }
+}
+```
+
+- `session_open` — `false` only when the instrument is **not trading at all**:
+  `last.is_close` true, or no quote and no recent print. Otherwise `true`. A US
+  stock in pre-market is trading, so this is `true` for it.
+- `rth_open` — is the instrument's **regular** session open right now? `open` coming
+  back as `0.0` from the snapshot means the regular session has not opened today,
+  which is the cleanest signal available for US listings. Leave the field out when
+  you cannot tell; the engine then simply uses DAY.
+- `extended_session` — `true` only on **positive evidence** that the instrument is
+  trading outside its regular session right now: `rth_open` false, **and** a
+  two-sided `bid_ask`, **and** a `last.ts` within roughly the last half hour, **and**
+  non-zero `volume`. All four. Measured example that qualifies: GOOGL at 06:23 New
+  York — `open` 0.0, bid 348.25 / ask 348.31, volume 131k, fresh timestamp. Do not
+  infer this from the exchange, the country or the asset class, and never set it
+  because an overnight session *ought* to exist: a wrong `true` sends a
+  time-in-force the venue cannot honour, and nothing rejects it.
+- `asset_class` — from `get_account_positions`, or whatever the contract search
+  reported. `create_order_instruction` can build orders for **STK, FUT, single-leg
+  OPT and single-leg FOP only**, plus combos whose legs are both equity options.
+  Anything else, and every futures, future-option or mixed spread, has to be
+  refused — the engine does that and says so in words the reader can act on.
+- `market_value` — the broker's own valuation of the holding, **in the instrument's
+  own currency, exactly as `get_account_positions` returns it.** Do not convert it.
+  The engine compares it against the register's own quantity × price × multiplier to
+  catch a wrong multiplier or currency in the source's instrument table.
+- `working_qty` — the **signed** net quantity still working on that contract from
+  `get_account_orders` (`remaining_shares_qty`, positive for BUY, negative for
+  SELL). `working_age_hours` from `order_time`.
+- `sessions_since_publication` — as counted above.
+
+Every field is optional and every check it feeds is simply skipped when the field is
+missing. An older caller that passes no `market.json` behaves exactly as before.
+
 ### 3. Run the engine
 
 ```
 python3 <skill-dir>/scripts/mirror.py \
   --signals <signal-file> --nav <net_liquidation> --prices <prices.json> \
-  --positions <positions.json> --min-pct 0.75
+  --positions <positions.json> --market <market.json> \
+  --available-funds <available_funds> --min-pct 0.75
 ```
 
 **`--positions` is not optional here.** The engine sizes each order from the weight
@@ -304,6 +400,26 @@ it from the reader's config if they have set their own.
 `prices.json` maps `contract_id_ex` to the current price. The script returns, for
 each trade: side, quantity, limit price, an `action` of OK / WARN / BLOCK / SKIP,
 and the cost the delay has already incurred.
+
+**How the limit is set.** The tolerance added to the published price is the tighter
+of 0.10% of the reader's NAV and 2% of the instrument's price, floored at one tick.
+The same 0.10% is the point at which the engine stops preparing because the market
+has already run too far. Both numbers were widened or tightened on 6 October 2026
+from 0.30% of NAV and 0.5% of price: measured against three months of daily bars,
+a 0.5% limit was unreachable about half the time on a large-cap equity and 84% of
+the time on a volatile small cap, which is not protection but a quiet refusal to
+trade. The tick floor exists because on an instrument whose notional dwarfs capital
+— a rate future published at several hundred per cent of portfolio — the cash
+budget divided by that weight lands below the minimum price increment, and the limit
+would otherwise collapse onto the published price.
+
+**`working_qty` is netted into the reader's holding, not reported beside it.** An
+order already working is the part of the position that is in flight. Without this a
+reader building a position a point at a time gets a second order for a gap the first
+order is already closing, and if both fill the position overshoots the published
+target. Every working order counts, including ones the reader placed themselves,
+because the broker does not say who placed them: the netting can under-order, never
+double-order.
 
 ### 4. Clear stale instructions — run this EVERY time, including quiet days
 
@@ -340,16 +456,62 @@ For each result with action OK or WARN, call `create_order_instruction` with the
 script's `contract_id_ex`, `side`, `quantity`, `order_type`, `limit_price` and
 `time_in_force` exactly as returned.
 
-For BLOCK, create nothing. Tell the user the market has moved beyond tolerance and
-that they should contact the source.
+**Send `time_in_force` exactly as the engine returned it — `DAY`, or `OND` where it
+said so. Never `GTC`, and never substitute a value of your own, whatever a reader
+asks for.** `DAY` dies at that session's close; `OND` carries into the next trading
+day and then stops. Both are bounded, which is the whole safety argument, because
+the broker connector has **no cancel**: `get_account_orders` only reads, and
+`delete_order_instruction` removes an instruction that was never submitted, not a
+live order. An order this skill cannot cancel, on a signal that has expired, waiting
+for a reader who does not check, is the one failure with no bound on it — and `GTC`
+is how it would happen.
 
-For SKIP, create nothing and explain that their account is too small for this trade
-to round to a whole contract.
+**If the result carries a `time_in_force_note`, relay it.** It explains why the
+order's life differs from the usual, and where relevant it mentions the broker's
+"outside regular trading hours" option. Say plainly that the reader does not have to
+do anything about that: if it is not enabled the order waits for the regular
+session.
 
-**If `all_skipped` is true, say so as a problem, not as good news.** Every trade
-rounding to zero means the account is too small (or unfunded) for this source's
-position sizes — which must never be reported in the same words as "your portfolio
-needs no action".
+For BLOCK, create nothing, and read the engine's own `message` — it says which of
+these happened:
+
+- **the market has moved beyond tolerance.** Say so, and that the position can be
+  reconsidered when the source next publishes on it. Do not suggest chasing it.
+- **the instrument type cannot be ordered through this connector.** Say plainly that
+  the order has to be placed in their broker's own app, and do not pretend a
+  workaround exists.
+- **the register and the broker disagree about what a holding is worth.** This is bad
+  reference data at the source, not a market event. Say that a multiplier or a
+  currency in the source's instrument table looks wrong, so any quantity computed
+  from it would be wrong by the same factor, and that nothing was prepared.
+- **the account cannot fund it.** Report the figure the broker gave and what the
+  order would cost. Never present this as a reason to use margin.
+
+For SKIP, create nothing, and again take the reason from the message:
+
+- the account is too small for this trade to round to a whole contract;
+- the gap is below `--min-pct` and the commission would exceed what it corrects;
+- the reader's holding is on the other side of what was published;
+- **the venue is closed.** This one is not a problem and must not be reported as
+  one. Nothing was prepared because the limit would have been derived from a price
+  nobody can currently trade against. Say that the next scheduled check which finds
+  the venue open will prepare the order against a live price, and that the signal's
+  validity has been held open across the closure so nothing is lost. The reader has
+  nothing to do — in particular they are never asked to tick an extended-hours box,
+  which is a setting this connector cannot write and no reader should be relied on
+  to remember.
+
+**If `all_skipped` is true, say so as a problem, not as good news** — unless every
+skip was a closed venue, which is a wait rather than a failure. Every trade rounding
+to zero means the account is too small (or unfunded) for this source's position
+sizes, which must never be reported in the same words as "your portfolio needs no
+action".
+
+**If `working_orders_at_broker` is not empty, put it at the top of the report**, with
+each order's age. These are orders already working that this skill cannot cancel. One
+whose signal has since expired will sit there until the reader cancels it by hand, and
+the only thing this skill can do about it is make sure they are told. State the age in
+days where it is more than one — an order working for a fortnight is the point.
 
 For ERROR or anything listed under `unusable`, create nothing and report exactly what
 the engine said. Never fill a gap with an assumption.

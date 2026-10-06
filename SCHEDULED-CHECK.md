@@ -52,8 +52,10 @@ figure that is missing with an estimate, and if something does not add up report
 instead of working around it: a problem nobody sees is a trade that disappeared in
 silence.
 
-If the markets are closed and there are no current prices, say so and give the
-timestamp of the last quote available, rather than passing it off as current.
+If a venue is closed, nothing is prepared for the instruments that trade there — say
+which ones and that the next run finding the venue open will prepare them against a
+live price. That is a wait, not a failure, and the reader has nothing to do about it.
+Never pass a closing price off as a current one.
 
 Report compactly. If there is nothing new, two lines are enough.
 ```

@@ -130,11 +130,41 @@ half-to-even, so 2.5 goes to 2 while 3.5 goes to 4, which is indefensible in a s
 calculation. Any residual difference is reported, never hidden, both in percentage
 points of the portfolio and as a proportion of the position.
 
-**The limit price.** Set at the tighter of two bounds: a budget expressed as a share
-of the portfolio, and a cap of 0.5% of the price. The budget alone is not sufficient —
-dividing a fixed cash budget by position size would grant a small position an enormous
-allowed price move. The result is rounded to a tradable increment, always in the
-stricter direction.
+**The limit price.** Set at the tighter of two bounds — a budget of 0.10% of the
+portfolio and a cap of 2% of the price — and then floored at one tick. The budget
+alone is not sufficient: dividing a fixed cash budget by position size would grant a
+small position an enormous allowed price move. The cap alone is not sufficient
+either: on an instrument whose notional dwarfs capital the budget is what binds, and
+it can land below the instrument's minimum price increment, which is why there is a
+floor. The result is rounded to a tradable increment, always in the stricter
+direction.
+
+The cap was 0.5% until October 2026. Measured against three months of daily bars, the
+gap between one session's close and the next session's open exceeded 0.5% about half
+the time on a large-cap equity and 84% of the time on a volatile small cap — so the
+order sat behind a price that could not be reached while the source's position had
+already moved. That is not protection, it is a refusal to trade.
+
+**Trading hours.** Nothing is prepared while an instrument is not trading at all — no
+quote, no recent prints — because a limit derived from a price nobody can trade
+against is not a limit. The scheduled check runs hourly and the run that finds it
+trading prepares the order against a live price. A signal's validity is held open
+across the closure, so a trade published on a Friday evening is still prepared when
+the market reopens.
+
+Extended-hours trading is treated as trading. Where an instrument's regular session is
+shut but it is demonstrably quoting and printing outside it, the order is prepared with
+a time in force of **OND** — overnight, carrying into the next regular session — so it
+does not expire with that evening's extended session. This is done only on live
+evidence from the broker's own quote, never from a list of venues: `OND` is accepted by
+the broker even on venues that have no overnight session, so a wrong assumption is
+caught nowhere. With no such evidence the order is a plain **DAY** order. It is never
+`GTC`, so nothing this tool prepares can sit in the market indefinitely — which matters
+because the broker connector offers no way to cancel an order once submitted.
+
+Where the broker's app also offers an "outside regular trading hours" option, the order
+note says so, since this tool cannot set that field. Nothing depends on the reader
+enabling it: if they do not, the order waits for the regular session.
 
 **Prices.** Figures are measured against the price recorded in the file at
 publication, not against any execution price. Where no live quote is available the

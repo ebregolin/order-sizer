@@ -73,20 +73,32 @@ Usage:
       [--positions positions.json]
 """
 import argparse, json, re, sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Slippage budget, as a share of the USER'S NAV. Deliberately not a percentage of
 # price: 0.1% on a three-month rate future is 10bp of rate (enormous), the same 0.1%
 # on bitcoin is noise. Cost-as-share-of-capital is the only measure comparable across
 # a book holding both, and it is the number a user actually understands.
-SLIP_WARN_NAV = 0.0015   # 0.15% — warn, still allow
-SLIP_BLOCK_NAV = 0.0030  # 0.30% — do not prepare the order
+# Recalibrated 2026-10-06. The budget was 0.30% of NAV, which on a position of a
+# few per cent granted several per cent of price movement — far more than any
+# plausible drift between publication and check, so the cash leg almost never bound
+# and the relative cap did all the work. 0.10% is the slippage a reader should
+# actually be asked to accept on one entry.
+SLIP_WARN_NAV = 0.0005   # 0.05% — warn, still allow
+SLIP_BLOCK_NAV = 0.0010  # 0.10% — do not prepare the order
 
 # The cash budget alone is NOT sufficient to set a limit. Dividing a fixed budget by
 # position size means the allowed price move scales inversely with weight: a position
 # worth 1% of NAV would be granted ~30% of price movement, i.e. no protection at all.
 # So the limit is the TIGHTER of the cash budget and a relative cap on price.
-REL_CAP = 0.005          # never allow more than 0.5% of price, whatever the budget
+# Widened 2026-10-06 from 0.5% to 2%. Measured on three months of daily bars from
+# the kind of book this tool follows, the overnight gap between one session's close
+# and the next session's open exceeded 0.5% about half the time on a large-cap
+# equity and 84% of the time on a volatile small cap. A limit that tight was not
+# protecting the reader, it was declining to trade: the order sat behind an
+# unreachable price while the source's position had already moved. At 2% the same
+# measurement is reached 90% / 56% / 98% of the time on the three names tested.
+REL_CAP = 0.02           # never allow more than 2% of price, whatever the budget
 # A generous ceiling, present only to stop a pathological cell (a pasted document,
 # a runaway formula) from flooding the agent's context. It is NOT a security control:
 # a 300-character injection works exactly as well as a 3000-character one, so a tight
@@ -109,6 +121,22 @@ DEV_WARN_PP = 3.0
 # them uncovered. A relative check catches exactly what the absolute one cannot: a
 # large proportional change to a small position.
 DEV_WARN_REL = 50.0      # per cent of the published weight
+
+# Instrument types for which create_order_instruction can actually build an order.
+# Everything else - bonds, CFDs, funds, crypto, warrants, commodities, indices -
+# and every combo whose legs are not both equity options, has to be refused HERE,
+# with a sentence the reader can act on, rather than failing somewhere downstream
+# inside the broker call where the cause is invisible.
+ORDERABLE_CLASSES = {"STK", "FUT", "OPT", "FOP"}
+
+# The register computes a position's value as quantity x price x multiplier. The
+# broker reports the same position's value independently. If the two disagree by
+# more than this factor, a multiplier or a currency in the register is wrong - the
+# failure that put a London position in pence against a quote in pounds, off by a
+# hundred. A genuine price move cannot produce a threefold disagreement, so this
+# fires only on bad reference data. It can only be checked on an instrument the
+# reader already holds: for a new position the broker has nothing to compare.
+VALUE_DISAGREE_FACTOR = 3.0
 
 
 def round_half_away(x):
@@ -240,7 +268,7 @@ def build_message(action, slip_warn, dev_warn, dev_pp, dev_rel, cost_nav, fillab
     return " ".join(parts)
 
 
-def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
+def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
     """One published position -> one user instruction.
 
     price_now may be None. Some accounts have no live data subscription for some
@@ -259,6 +287,55 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
     ref = t.get("signal_price")
     pb, pa = t.get("pct_before"), t.get("pct_after")
 
+    mkt = mkt or {}
+    # Signed net quantity of orders already working at the broker on this contract.
+    # It belongs with the holding, not beside it: see the netting comment below.
+    working = mkt.get("working_qty") or 0.0
+
+    # Can the broker connector build an order for this instrument at all? Asked
+    # first, because no amount of correct arithmetic helps if the answer is no.
+    ac = str(mkt.get("asset_class") or t.get("asset_class") or "").upper()
+    if ac and ac not in ORDERABLE_CLASSES:
+        return {"action": "BLOCK", "desc": desc0, "asset_class": ac,
+                "message": f"The broker connector cannot prepare orders for "
+                           f"instrument type {ac}. It builds orders for shares, "
+                           "futures and single-leg options only. This position has "
+                           "to be traded directly in your broker's own app."}
+
+    # Reference-data cross-check. Two independent measures of the SAME position:
+    # what the register's own arithmetic says it is worth, and what the broker
+    # reports. They cannot disagree threefold for any market reason.
+    bval = mkt.get("market_value")
+    if held and bval and ref and mult:
+        implied_local = abs(held) * abs(ref) * mult        # instrument currency
+        broker_local = abs(float(bval))                    # instrument currency
+        if implied_local > 0 and broker_local > 0:
+            r = max(implied_local / broker_local, broker_local / implied_local)
+            if r > VALUE_DISAGREE_FACTOR:
+                return {"action": "BLOCK", "desc": desc0,
+                        "register_value": round(implied_local, 2),
+                        "broker_value": round(broker_local, 2),
+                        "message": f"The register and your broker disagree about what "
+                                   f"this position is worth by a factor of {r:.0f} "
+                                   f"({implied_local:,.0f} against {broker_local:,.0f} "
+                                   "in the instrument's own currency). A multiplier or "
+                                   "a currency in the source's instrument table is "
+                                   "wrong, so any quantity computed from it would be "
+                                   "wrong by the same factor. Nothing prepared."}
+
+    # Is the venue trading right now? An instruction built while the venue is shut
+    # carries a limit derived from a price nobody can currently trade against, and
+    # the reader cannot be relied on to tick an extended-hours box by hand. The
+    # scheduled check runs every hour, so the cheapest correct answer is to prepare
+    # nothing now and let the run that finds the venue open do it against a live
+    # price. Nothing is lost: the signal's own validity is extended across the
+    # closure so a Friday evening publication is still prepared on Monday.
+    if mkt.get("session_open") is False:
+        return {"action": "SKIP", "desc": desc0, "session_open": False,
+                "message": "The venue for this instrument is closed right now, so "
+                           "nothing was prepared. The next scheduled check that finds "
+                           "it open will prepare this order against a live price."}
+
     if pb is not None and pa is not None:
         # Percentage form. Convert the source's weight change into the notional it
         # represents for THIS user, then into contracts.
@@ -276,8 +353,17 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
         # The current weight is measured at the PUBLICATION price, not the live one,
         # so that a price move between publication and check cannot by itself create
         # or cancel an order. Publications move this tool; prices never do.
+        # Orders already working count as if they were filled. They are not a
+        # separate fact from the holding, they are the part of it that is in
+        # flight: a reader building a position one point at a time would
+        # otherwise be handed a second order for a gap the first order is
+        # already closing, and if both filled the position would overshoot the
+        # published target. Netting them in is conservative in the only
+        # direction that matters - it can under-order, never double-order.
+        # Every working order counts, including ones the reader placed
+        # themselves, because the broker does not say who placed them.
         if held is not None:
-            current_pct = held * ref * mult / (nav * fx) * 100.0
+            current_pct = (held + working) * ref * mult / (nav * fx) * 100.0
         else:
             current_pct = pb
         gap = pa - current_pct
@@ -396,6 +482,21 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
 
     budget_tol = SLIP_BLOCK_NAV * nav * fx / (qty * mult)
     tol = min(budget_tol, REL_CAP * abs(ref))
+    # Floor at one tick. On an instrument whose notional dwarfs capital - a rate
+    # future published at several hundred per cent of portfolio - the cash budget
+    # divided by that weight comes out below the instrument's own minimum price
+    # increment. Rounding then collapses the limit onto the published price and the
+    # order can only fill if the market has not moved at all, which is no limit at
+    # all. The arithmetic is right (on twenty times notional you genuinely cannot
+    # afford slippage) but a sub-tick limit is an unfillable order, not a tight one.
+    _tick = t.get("tick_size")
+    try:
+        _tick = abs(float(_tick)) if _tick else None
+    except (TypeError, ValueError):
+        _tick = None
+    tol_floored = bool(_tick and tol < _tick)
+    if tol_floored:
+        tol = _tick
     limit = round_to_tick(ref + tol if side == "BUY" else ref - tol,
                           t.get("tick_size"), side, ref)
 
@@ -425,6 +526,41 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
     if dev_warn and action == "OK":
         action = "WARN"
 
+    # Time in force. DAY by default: the order dies at the close of the session it
+    # was prepared in, so nothing this tool prepares can still be working tomorrow
+    # against a signal the source has since moved on from. That bound matters more
+    # than usual because the broker connector has NO CANCEL - nothing here can
+    # retract an order once the reader has submitted it.
+    #
+    # The one exception is an instrument whose regular session is shut while an
+    # extended session is demonstrably running for it right now. A DAY order there
+    # can expire with tonight's extended session without ever reaching the regular
+    # one, which is the opposite of what the reader wants. OND - overnight, carrying
+    # into the next trading day - is the right setting, and its life is still
+    # bounded at about two sessions rather than open-ended.
+    #
+    # OND is sent ONLY on positive evidence that an extended session is running. It
+    # is deliberately not sent from a list of venues or asset classes: tested on
+    # 6 October 2026, create_order_instruction ACCEPTED OND on an LSE stock, which
+    # has no overnight session at all - it stored tif "OND" with no rejection and no
+    # warning. So a wrong guess is not caught anywhere, and "try OND, fall back to
+    # DAY" cannot work because nothing rejects. Evidence, or DAY.
+    tif = "DAY"
+    tif_note = None
+    if mkt.get("rth_open") is False and mkt.get("extended_session") is True:
+        tif = "OND"
+        tif_note = ("This instrument's regular session is closed, but it is trading "
+                    "in an extended session right now. The order is set to carry "
+                    "into the next regular session rather than expire with tonight's, "
+                    "so it does not have to be prepared again. Depending on which "
+                    "extended session your broker routes it to, the app may also "
+                    "offer an 'outside regular trading hours' option - this tool "
+                    "cannot set it. You do not have to do anything: if it is not "
+                    "enabled the order simply waits for the regular session to open.")
+    elif mkt.get("rth_open") is False:
+        tif_note = ("This instrument's regular session is closed. The order is "
+                    "prepared to work when it opens.")
+
     return {
         "action": action,
         "contract_id_ex": t["contract_id_ex"],
@@ -435,7 +571,10 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
         "quantity": qty,
         "order_type": "LIMIT",
         "limit_price": limit,
-        "time_in_force": "DAY",
+        "time_in_force": tif,
+        "time_in_force_note": tif_note,
+        "rth_open": mkt.get("rth_open"),
+        "extended_session": mkt.get("extended_session"),
         "scale": round(scale, 4) if scale else None,
         "delta_pct_portafoglio": round(delta_pct, 3) if delta_pct is not None else None,
         "published_delta_pct": round(pa - pb, 3) if (pa is not None and pb is not None) else None,
@@ -452,7 +591,12 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75):
         "slippage_measured": have_quote,
         "fillable_now": fillable,
         "tolerance_used": round(tol, 8),
-        "tolerance_source": "budget" if budget_tol <= REL_CAP * abs(ref) else "cap 0.5%",
+        "tolerance_floored_at_tick": tol_floored,
+        "working_qty_netted": working or 0,
+        "session_open": mkt.get("session_open"),
+        "tolerance_source": ("one tick (floor)" if tol_floored else
+                             "budget 0.10% of NAV" if budget_tol <= REL_CAP * abs(ref)
+                             else "cap 2% of price"),
         "held_before": held,
         "adjustment_note": note,
         "delay_cost_account_ccy": round(cost, 2),
@@ -476,6 +620,23 @@ def main():
                     help="JSON mapping contract_id_ex -> quantity currently held. "
                          "Strongly recommended: without it, reductions cannot be "
                          "checked against what you actually own.")
+    ap.add_argument("--market", default=None,
+                    help="JSON mapping contract_id_ex -> object with any of: "
+                         "session_open (bool, false when the venue is shut), "
+                         "asset_class (STK/FUT/OPT/FOP/...), market_value (the "
+                         "broker's own valuation of the holding, in the instrument's "
+                         "currency), working_qty (signed net quantity of orders "
+                         "already working), working_age_hours. Every field is "
+                         "optional and every check it feeds is skipped when absent, "
+                         "so an older caller keeps working unchanged.")
+    ap.add_argument("--closure-grace-hours", type=float, default=96.0,
+                    help="How far past its stated expiry a signal may still be acted "
+                         "on when the venue has had no trading session since it was "
+                         "published. Covers a weekend plus holidays. Default 96.")
+    ap.add_argument("--available-funds", type=float, default=None,
+                    help="Funds the broker reports as available, in the account's "
+                         "currency. When given, buy orders that together exceed it "
+                         "are not prepared.")
     a = ap.parse_args()
 
     if a.nav <= 0:
@@ -485,6 +646,7 @@ def main():
         sig = json.load(open(a.signals))
         prices = json.load(open(a.prices))
         held_map = json.load(open(a.positions)) if a.positions else None
+        mkt_map = json.load(open(a.market)) if a.market else {}
     except (OSError, ValueError) as e:
         sys.exit(f"File could not be read: {e}")
 
@@ -506,14 +668,34 @@ def main():
         if exp is None and (t.get("expires_at") or sig.get("expires_at")):
             bad.append(f"{clean(t.get('desc'))}: expiry unreadable — discarded")
             continue
-        if exp and exp < now:
-            expired.append({"desc": clean(t.get("desc")),
-                            "expired_at": exp.isoformat(timespec="seconds")})
-            continue
         cid = t.get("contract_id_ex")
         if not cid:
             bad.append(f"{clean(t.get('desc'))}: identifier missing — discarded")
             continue
+        _mk = mkt_map.get(cid) if isinstance(mkt_map, dict) else None
+        if not isinstance(_mk, dict):
+            _mk = {}
+        extended = False
+        if exp and exp < now:
+            # The validity the source writes against a trade is wall-clock hours, and
+            # wall-clock hours run through nights and weekends when nobody could have
+            # traded. A position published late on a Friday with a day's validity was
+            # dead before the venue next opened: the reader was never once given the
+            # chance the source intended to give them. So when the venue has not
+            # completed a single session since publication, the signal survives its
+            # stated expiry - up to a bounded grace that covers a weekend plus
+            # holidays, never indefinitely. It can only ever lengthen a window, never
+            # shorten one, so a publication inside a normal trading week behaves
+            # exactly as before. If the caller does not say how many sessions have
+            # passed, the old rule applies unchanged and the signal expires.
+            sessions = _mk.get("sessions_since_publication")
+            if sessions == 0 and (now - exp) <= timedelta(hours=a.closure_grace_hours):
+                extended = True
+            else:
+                expired.append({"desc": clean(t.get("desc")),
+                                "expired_at": exp.isoformat(timespec="seconds"),
+                                "sessions_since_publication": sessions})
+                continue
         # A MISSING QUOTE IS NOT A REASON TO DROP THE TRADE. mirror_one handles
         # price_now=None deliberately (see its docstring). An earlier version
         # filtered here first, which made that whole branch unreachable: the
@@ -531,9 +713,60 @@ def main():
             held = held_map.get(cid, 0) if held_map is not None else None
             sig_mult[cid] = t.get("multiplier") or 1
             sig_fx[cid] = t.get("fx") or 1
-            results.append(mirror_one(t, a.nav, price_now, held, a.min_pct))
+            r = mirror_one(t, a.nav, price_now, held, a.min_pct, _mk)
+            if extended:
+                r["expiry_extended_over_closure"] = True
+            results.append(r)
         except (KeyError, TypeError, ValueError) as e:
             bad.append(f"{clean(t.get('desc'))}: incomplete data ({e}) — discarded")
+
+    def _notional(r):
+        """One prepared order's cost in the ACCOUNT's currency."""
+        return (r["quantity"] * abs(r.get("signal_price") or 0)
+                * (sig_mult.get(r.get("contract_id_ex")) or 1)
+                / (sig_fx.get(r.get("contract_id_ex")) or 1))
+
+    # Buying power. The broker will happily let a margin account buy several times
+    # its own net worth, so a reader who approves every order in a run without
+    # looking can end up levered without ever deciding to be. Only BUY orders are
+    # counted: a sale of something already held releases cash rather than consuming
+    # it. When the prepared buys exceed what the broker says is available, orders
+    # are dropped LARGEST FIRST - that funds the greatest number of the remaining
+    # instructions - until the rest fit.
+    unfunded = []
+    if a.available_funds is not None:
+        buys = [r for r in results
+                if r["action"] in ("OK", "WARN") and r.get("side") == "BUY"]
+        total = sum(_notional(r) for r in buys)
+        for r in sorted(buys, key=_notional, reverse=True):
+            if total <= a.available_funds:
+                break
+            cost = _notional(r)
+            total -= cost
+            r["action"] = "BLOCK"
+            r["message"] = (
+                f"Not prepared: your broker reports {a.available_funds:,.0f} "
+                f"available and this order alone costs {cost:,.0f} in your account's "
+                "currency. The buy orders in this run together exceed the funds "
+                "available, so the largest were dropped until the rest could be "
+                "funded. Nothing here was sized on margin you had not already "
+                "decided to use.")
+            unfunded.append({"desc": r.get("desc"), "cost": round(cost, 2)})
+
+    # Orders already working at the broker, echoed back so the reader can see them.
+    # The broker connector has no cancel, so a working order whose signal has since
+    # expired can only be reported, never cleaned up from here - and it is reported
+    # at the top of the run for exactly that reason.
+    working_orders = []
+    if isinstance(mkt_map, dict):
+        for cid, mk in mkt_map.items():
+            if isinstance(mk, dict) and mk.get("working_qty"):
+                working_orders.append({
+                    "contract_id_ex": cid,
+                    "working_qty": mk.get("working_qty"),
+                    "age_hours": mk.get("working_age_hours"),
+                    "desc": mk.get("desc"),
+                })
 
     json.dump({
         "generated_at": now.isoformat(timespec="seconds"),
@@ -545,6 +778,9 @@ def main():
             r["quantity"] * r["signal_price"] * (sig_mult.get(r["contract_id_ex"]) or 1)
             / (sig_fx.get(r["contract_id_ex"]) or 1)
             for r in results if r["action"] in ("OK", "WARN")), 2),
+        "available_funds_account_ccy": a.available_funds,
+        "not_prepared_for_lack_of_funds": unfunded,
+        "working_orders_at_broker": working_orders,
         "all_skipped": bool(results) and all(r["action"] == "SKIP" for r in results),
         "to_create": [r for r in results if r["action"] in ("OK", "WARN")],
         "blocked": [r for r in results if r["action"] in ("BLOCK", "ERROR")],
