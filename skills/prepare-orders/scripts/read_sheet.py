@@ -233,6 +233,96 @@ def key(name):
 TRADES_SHEET = ("operazioni", "trades")
 INSTR_SHEET = ("strumenti", "instruments")
 POS_SHEET = ("posizioni", "positions")
+MARKETS_SHEET = ("markets", "mercati")
+HOLIDAYS_SHEET = ("market holidays", "festività mercati", "festivita mercati")
+
+
+def _hhmm(v):
+    """'9:30', '09:30', an Excel time fraction or an ISO timestamp -> '09:30'."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)) and 0 <= float(v) < 1:
+        mins = round(float(v) * 1440)
+        return f"{mins // 60:02d}:{mins % 60:02d}"
+    m = re.search(r"(\d{1,2}):(\d{2})", str(v))
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ValueError(f"not a time: {v!r}")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _ymd(v):
+    """'2026-12-24', an ISO timestamp, '24/12/2026' or an Excel serial -> '2026-12-24'."""
+    from datetime import date
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)) and float(v) > 20000:
+        return (date(1899, 12, 30) + timedelta(days=int(float(v)))).isoformat()
+    t = str(v).strip()
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", t)
+    if m:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    m = re.match(r"(\d{1,2})[/.](\d{1,2})[/.](\d{4})$", t)
+    if m:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+    raise ValueError(f"not a date: {v!r}")
+
+
+def _codes(v):
+    return [c.strip().upper() for c in re.split(r"[,;/]", str(v or "")) if c.strip()]
+
+
+def read_markets(sheets, first_row=6):
+    """Regular hours and holidays published by the source, or None if absent.
+
+    The source keeps them in its own register so that they travel with every
+    publication: no plugin release, no reinstall. A malformed row is reported and
+    skipped; it never stops the trades from being read, because the engine falls
+    back to its own table for any market missing here.
+    """
+    from zoneinfo import ZoneInfo
+    rows_h, _ = pick(sheets, MARKETS_SHEET)
+    if rows_h is None:
+        return None, []
+    markets, probs = {}, []
+    for r in [x for x in rows_h if rownum(x, 0) >= first_row]:
+        if not get(r, 0):
+            continue
+        where = f"Markets row {rownum(r, '?')}"
+        try:
+            tz = str(get(r, 1) or "").strip()
+            ZoneInfo(tz)
+            opens, closes = _hhmm(get(r, 2)), _hhmm(get(r, 3))
+            if not opens or not closes or opens >= closes:
+                raise ValueError("opening and closing time missing or reversed")
+        except Exception as e:                      # noqa: BLE001 - reported
+            probs.append(f"{where}: {e}")
+            continue
+        t = str(get(r, 4) or "").strip().upper().replace(" ", "")
+        # OVERNIGHT: an overnight session exists (orders go out as OND).
+        # PRE/POST: traded before/after the session only with 'outside RTH' ticked.
+        # YES is the earlier spelling of OVERNIGHT.
+        ext = ("overnight" if t in ("OVERNIGHT", "OND", "YES", "SI", "SÌ", "Y") else
+               "prepost" if t in ("PRE/POST", "PREPOST", "PRE-POST", "OUTSIDERTH",
+                                  "EXTENDED") else None)
+        for c in _codes(get(r, 0)):
+            markets[c] = {"tz": tz, "opens": opens, "closes": closes,
+                          "extended": ext, "exceptions": {}}
+    rows_x, _ = pick(sheets, HOLIDAYS_SHEET)
+    for r in [x for x in (rows_x or []) if rownum(x, 0) >= first_row]:
+        if not get(r, 0):
+            continue
+        where = f"Market holidays row {rownum(r, '?')}"
+        try:
+            d, early = _ymd(get(r, 1)), _hhmm(get(r, 2))
+        except ValueError as e:
+            probs.append(f"{where}: {e}")
+            continue
+        for c in _codes(get(r, 0)):
+            if c in markets:
+                markets[c]["exceptions"][d] = early
+            else:
+                probs.append(f"{where}: {c} has no row in Markets")
+    return markets, probs
 
 
 def pick(sheets, names):
@@ -500,18 +590,22 @@ def main():
         if not source_positions:
             pos_note = "The Positions sheet is present but empty."
 
+    markets, markets_problems = read_markets(sheets)
+
     if a.tz:
         for t in trades:
             t["published_at_local"] = local_stamp(t.get("published_at"), a.tz)
             t["expires_at_local"] = local_stamp(t.get("expires_at"), a.tz)
 
     signal = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "timezone": a.tz,
         "source_declares_utc": declares_utc(a.file),
         "source_positions": source_positions,
         "source_positions_note": pos_note,
         "fx_rates": fx,
+        "markets": markets,
+        "markets_problems": markets_problems,
         "source_file": os.path.basename(a.file),
         "read_at": now.isoformat(timespec="seconds"),
         "audience": a.audience,

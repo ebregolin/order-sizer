@@ -9,7 +9,7 @@ description: >
   ordini", "controlla la fonte", "aggiorna il portafoglio", "¿hay operaciones
   nuevas?", "gibt es neue Trades?" — and on a scheduled check.
 metadata:
-  version: "2.3.0"
+  version: "2.6.0"
 ---
 
 # Prepare orders
@@ -78,7 +78,7 @@ it came from, and ask what they want to do.
 
 **State the version when you first act in a session.** This plugin is installed from
 a file and has no update channel, so a user can be running an old build without any
-sign of it. Say "order-sizer 2.3.0" once, early. A tester comparing notes needs to
+sign of it. Say "order-sizer 2.6.0" once, early. A tester comparing notes needs to
 know which build produced them.
 
 **Time in force is DAY, or OND where the engine says so. Never GTC, never anything
@@ -89,12 +89,31 @@ on from. GTC can, and the broker connector **has no cancel** — an order left w
 is one nobody can retract, and a reader who does not check their app would never
 know. These bounds are what limit the damage any single run can do.
 
-**Never send OND on your own judgement.** The engine sends it only on positive
-evidence that an extended session is running for that instrument right now. Tested
-on 6 October 2026: `create_order_instruction` **accepted OND on an LSE stock**,
-which has no overnight session at all — stored as `tif: "OND"` with no rejection and
-no warning. Nothing catches a wrong guess, so "try OND and fall back" is not
-available. Evidence, or DAY.
+**Never send OND on your own judgement.** The engine decides from the clock and the
+source's Markets sheet: OND only for a market marked OVERNIGHT (US listings) while
+outside its regular session; everything else DAY. A market marked PRE/POST is
+traded by the broker before and after its session only for orders flagged
+'outside RTH', which this connector cannot set: outside its regular hours (on a
+trading day) the engine prepares a DAY order with a note telling the reader they
+MAY tick that box to execute early — if they don't, the order waits for the open.
+On weekends and market holidays a PRE/POST market is simply closed. Tested on
+6 October 2026: `create_order_instruction` **accepted OND on an LSE stock**, which
+has no overnight session at all — stored as `tif: "OND"` with no rejection and no
+warning. Nothing catches a wrong value, so it is never yours to choose.
+
+**Regular trading hours come from the clock, never from prices.** The engine checks
+the current time against each exchange's regular hours, in the exchange's own local
+time, using the Market column of the source's register. The hours, the market
+holidays and the early closes are read from the source's own workbook — its
+**Markets** and **Market holidays** sheets — so they are updated with every
+publication; `read_sheet.py` passes them to the engine as `markets`. Only when the
+workbook has no such sheets does the engine fall back to its built-in table, which
+knows no holidays. Prices are live in pre-market and after-hours, so a live quote
+says nothing about whether the regular session is open — and the broker accepts
+fractional orders in regular hours only. Do not compute regular hours yourself and
+do not pass them in. If `markets_problems` in the reader's output is not empty,
+report it: it means a row in the source's Markets sheets could not be read and the
+built-in table was used for that market instead.
 
 **Never prepare an order while the venue is genuinely closed** — no quote, no recent
 prints, `last.is_close` true. Extended-hours trading is *not* closed: a US stock in
@@ -108,7 +127,17 @@ because this connector cannot write that field. It is information, never a step:
 the reader ignores it the order simply waits for the regular session. Never present
 it as something they must do for the order to be safe.
 
-**Whole units only. Never a fractional quantity.** An instruction is prepared now
+**One exception to whole units: a full exit, in regular hours.** When the source
+closes a position completely, the engine sells exactly what the reader holds —
+fraction included — but only if the source's register marks the instrument
+fractionable **and** the clock puts it inside its exchange's regular hours, because the broker accepts
+fractional orders in regular trading hours only. Outside them it sells the whole
+units now and leaves the fraction for the first scheduled check in regular hours,
+which sweeps it: the source prefers a timely exit to a precise one. A full exit is
+also exempt from `--min-pct`, or a small residual holding would never be closed at
+all. Never round, trim or "tidy" these quantities yourself.
+
+**Whole units only. Never a fractional quantity**, apart from the exception above. An instruction is prepared now
 and submitted by a person later, possibly outside regular trading hours, when no
 venue accepts fractions. Which side of that line the submission falls on cannot be
 known when the order is built. `mirror.py` rounds; do not undo it and do not offer a
@@ -348,18 +377,6 @@ is known for each contract:
 - `session_open` — `false` only when the instrument is **not trading at all**:
   `last.is_close` true, or no quote and no recent print. Otherwise `true`. A US
   stock in pre-market is trading, so this is `true` for it.
-- `rth_open` — is the instrument's **regular** session open right now? `open` coming
-  back as `0.0` from the snapshot means the regular session has not opened today,
-  which is the cleanest signal available for US listings. Leave the field out when
-  you cannot tell; the engine then simply uses DAY.
-- `extended_session` — `true` only on **positive evidence** that the instrument is
-  trading outside its regular session right now: `rth_open` false, **and** a
-  two-sided `bid_ask`, **and** a `last.ts` within roughly the last half hour, **and**
-  non-zero `volume`. All four. Measured example that qualifies: GOOGL at 06:23 New
-  York — `open` 0.0, bid 348.25 / ask 348.31, volume 131k, fresh timestamp. Do not
-  infer this from the exchange, the country or the asset class, and never set it
-  because an overnight session *ought* to exist: a wrong `true` sends a
-  time-in-force the venue cannot honour, and nothing rejects it.
 - `asset_class` — from `get_account_positions`, or whatever the contract search
   reported. `create_order_instruction` can build orders for **STK, FUT, single-leg
   OPT and single-leg FOP only**, plus combos whose legs are both equity options.

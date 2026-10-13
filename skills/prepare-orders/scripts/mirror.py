@@ -74,6 +74,7 @@ Usage:
 """
 import argparse, json, re, sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # Slippage budget, as a share of the USER'S NAV. Deliberately not a percentage of
 # price: 0.1% on a three-month rate future is 10bp of rate (enormous), the same 0.1%
@@ -137,6 +138,96 @@ ORDERABLE_CLASSES = {"STK", "FUT", "OPT", "FOP"}
 # fires only on bad reference data. It can only be checked on an instrument the
 # reader already holds: for a new position the broker has nothing to compare.
 VALUE_DISAGREE_FACTOR = 3.0
+
+# Regular (continuous) trading hours by the exchange code in the source's register,
+# in the exchange's own local time, Monday to Friday. Read off the clock, not inferred
+# from prices or bars: prices stay live before and after the session, and the broker
+# accepts fractional orders in regular hours only. zoneinfo handles summer time.
+# Sources checked 13 October 2026: Xetra 09:00-17:30 CET (Deutsche Boerse); LSE
+# continuous trading between the 07:50-08:00 opening and 16:30-16:35 closing auctions
+# (SETS); Borsa Italiana shares 09:00-17:30. Euronext Paris/Amsterdam and the US core
+# session are the standard published hours, not re-verified that day.
+# Public holidays are deliberately NOT listed: on a holiday the broker rejects the
+# order or holds it, nothing executes, and the next run prepares it again.
+# An exchange missing from this table is treated as "hours unknown": no fractional
+# order is ever sent for it, and the reader is told so.
+_US = ("America/New_York", "09:30", "16:00")
+RTH_HOURS = {
+    "NASDAQ": _US, "NYSE": _US, "ARCA": _US, "AMEX": _US, "BATS": _US, "IEX": _US,
+    "LSE": ("Europe/London", "08:00", "16:30"),
+    "LSEETF": ("Europe/London", "08:00", "16:30"),
+    "IBIS": ("Europe/Berlin", "09:00", "17:30"),
+    "IBIS2": ("Europe/Berlin", "09:00", "17:30"),
+    "SBF": ("Europe/Paris", "09:00", "17:30"),
+    "AEB": ("Europe/Amsterdam", "09:00", "17:30"),
+    "BVME": ("Europe/Rome", "09:00", "17:30"),
+}
+# What the broker offers outside regular hours, per exchange (fallback only - the
+# source's register says this in its Markets sheet):
+#   "overnight" - an overnight session exists: orders go out as OND and carry into
+#                 the next regular session (US listings);
+#   "prepost"   - the broker trades it before/after the session through other
+#                 venues, but only for orders flagged 'outside RTH', a field this
+#                 connector cannot set: a DAY order is prepared now and the reader
+#                 MAY tick the box to execute at once; if not, it waits for the open.
+#                 Measured on IBKR hourly bars, 12-13 Oct 2026, and confirmed by the
+#                 source's own trading for IBIS/IBIS2/SBF.
+# Anything else: nothing is prepared until the regular session opens.
+EXTENDED_HOURS = {"NASDAQ": "overnight", "NYSE": "overnight", "ARCA": "overnight",
+                  "AMEX": "overnight", "BATS": "overnight", "IEX": "overnight",
+                  "IBIS": "prepost", "IBIS2": "prepost", "SBF": "prepost",
+                  "AEB": "prepost", "BVME": "prepost"}
+
+
+def outside_mode(v):
+    """Register cell -> 'overnight' / 'prepost' / None. YES is the 2.5.0 spelling of
+    'overnight' and is still accepted."""
+    t = str(v or "").strip().upper().replace(" ", "")
+    if t in ("OVERNIGHT", "OND", "YES", "SI", "SÌ", "Y", "TRUE"):
+        return "overnight"
+    if t in ("PRE/POST", "PREPOST", "PRE-POST", "OUTSIDERTH", "EXTENDED"):
+        return "prepost"
+    return None
+
+
+def market_state(code, now_utc, markets=None):
+    """(regular session open?, trades outside regular hours?, hours source, why).
+
+    Hours and holidays come first from the source's own register (its Markets and
+    Market holidays sheets, passed through by read_sheet.py), so they are updated
+    with every publication. The table above is only the fallback for a source
+    whose workbook does not carry them, and it knows no holidays. An exchange in
+    neither returns None for the first value: hours unknown, so no fractional
+    order is ever sent for it.
+    """
+    code = (code or "").strip().upper()
+    spec = (markets or {}).get(code)
+    if spec:
+        tz, opens, closes = spec["tz"], spec["opens"], spec["closes"]
+        ext, exc, src = outside_mode(spec.get("extended")), spec.get("exceptions") or {}, "register"
+    elif code in RTH_HOURS:
+        (tz, opens, closes), ext, exc, src = RTH_HOURS[code], EXTENDED_HOURS.get(code), {}, "built-in"
+    else:
+        return None, None, None, "hours unknown"
+    local = now_utc.astimezone(ZoneInfo(tz))
+    if local.weekday() >= 5:
+        return False, ext, src, "weekend"
+    day = local.date().isoformat()
+    why = None
+    if day in exc:
+        if not exc[day]:
+            return False, ext, src, "holiday"
+        closes, why = min(closes, exc[day]), "early close"
+    hm = local.strftime("%H:%M")
+    if opens <= hm < closes:
+        return True, ext, src, why
+    return False, ext, src, ("closed early today" if why and hm >= closes
+                             else "outside regular hours")
+
+
+def rth_by_clock(code, now_utc, markets=None):
+    """True/False from the clock and the exchange's hours; None if the code is unknown."""
+    return market_state(code, now_utc, markets)[0]
 
 
 def round_half_away(x):
@@ -268,7 +359,8 @@ def build_message(action, slip_warn, dev_warn, dev_pp, dev_rel, cost_nav, fillab
     return " ".join(parts)
 
 
-def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
+def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None, now=None,
+               markets=None):
     """One published position -> one user instruction.
 
     price_now may be None. Some accounts have no live data subscription for some
@@ -288,6 +380,22 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
     pb, pa = t.get("pct_before"), t.get("pct_after")
 
     mkt = mkt or {}
+    # A FULL EXIT is the one case where a fraction is not a sizing choice but simply
+    # what the reader holds. Shares bought before whole-unit rounding was introduced
+    # left fractional holdings behind; rounding the closing order then leaves a
+    # residue that is too small to clear the minimum-trade rule, so it is never
+    # ordered again and the position is never flat. Fractions are allowed here only,
+    # and only where they can actually execute: the source's register must mark the
+    # instrument fractionable, AND the regular session must be positively known to be
+    # open, because the broker accepts fractional orders in regular hours only.
+    # Outside them the source prefers a timely exit to a precise one: the whole-unit
+    # part is sold now and the residue is swept by the first run in regular hours.
+    full_close = (t.get("pct_after") == 0) or (t.get("new_qty") == 0
+                                                and t.get("pct_after") is None)
+    market = str(t.get("mercato") or t.get("market") or "").strip().upper()
+    rth, ext, hours_src, closed_why = market_state(
+        market, now or datetime.now(timezone.utc), markets)
+    frac_ok = bool(t.get("divisible")) and rth is True
     # Signed net quantity of orders already working at the broker on this contract.
     # It belongs with the holding, not beside it: see the netting comment below.
     working = mkt.get("working_qty") or 0.0
@@ -330,6 +438,20 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
     # nothing now and let the run that finds the venue open do it against a live
     # price. Nothing is lost: the signal's own validity is extended across the
     # closure so a Friday evening publication is still prepared on Monday.
+    # Pre/after-hours trading happens on trading days only: on a weekend or a market
+    # holiday a 'prepost' listing is simply closed.
+    if rth is False and (not ext or (ext == "prepost"
+                                     and closed_why in ("weekend", "holiday"))):
+        why = {"holiday": "closed today (market holiday)",
+               "weekend": "closed for the weekend",
+               "closed early today": "already closed today (early close)"}.get(
+                   closed_why, "outside its regular trading hours right now")
+        return {"action": "SKIP", "desc": desc0, "market": market, "rth_open": False,
+                "closed_because": closed_why, "hours_source": hours_src,
+                "message": f"{market} is {why}, so nothing was prepared. The next "
+                           "scheduled check inside its hours will prepare this order "
+                           "against a live price."}
+
     if mkt.get("session_open") is False:
         return {"action": "SKIP", "desc": desc0, "session_open": False,
                 "message": "The venue for this instrument is closed right now, so "
@@ -387,7 +509,10 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
                                f"{current_pct:.2f}%. Closing that gap would mean trading "
                                "against what was published, so nothing was prepared."}
 
-        if abs(gap) < min_pct:
+        # The minimum exists so that commission never exceeds the correction it
+        # buys. Exiting completely is not a correction, it is a different intent:
+        # without this exemption a small residual holding is stranded for ever.
+        if abs(gap) < min_pct and not (full_close and held):
             return {"action": "SKIP", "desc": desc0,
                     "current_pct": round(current_pct, 2), "target_pct": round(pa, 2),
                     "gap_pct": round(gap, 2),
@@ -418,6 +543,31 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
     # with no quantity at all. The Fractionable column stays in the source's sheet —
     # it is still true about the instrument — it simply no longer sizes anything.
     qty = round_half_away(raw)
+    residue = 0.0
+    if full_close and held:
+        # Size the exit from what is actually held, never from the rounded weight:
+        # rounding 12.6 up to 13 and then clamping back produced a truncated order.
+        if frac_ok:
+            # everything, fraction included; a whole holding stays an integer
+            qty = -held if held != int(held) else -int(held)
+        else:
+            whole = int(held)                # toward zero, works for shorts too
+            residue = held - whole
+            qty = -whole
+            if qty == 0:
+                if rth is None:
+                    msg = (f"The source has closed this position. You hold {held:g}, "
+                           "less than one whole unit, which can only be sold as a "
+                           "fractional order in regular trading hours - and this tool "
+                           "does not know the hours of "
+                           f"{market or 'this exchange'}. Sell it in your broker's app.")
+                else:
+                    msg = (f"The source has closed this position. You hold {held:g}, "
+                           "less than one whole unit, which can only be sold as a "
+                           "fractional order - and the broker accepts those during "
+                           f"{market} regular trading hours only. Nothing prepared now; "
+                           "the first scheduled check inside those hours will close it.")
+                return {"action": "SKIP", "desc": desc0, "held": held, "message": msg}
 
     desc = desc0
     if qty == 0:
@@ -460,7 +610,7 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
                                "order prepared, so as not to open the opposite one."}
         if have < qty:
             note = (f"Reduced from {qty:g} to {have:g}: that is what you actually hold.")
-            qty = int(have)
+            qty = have if frac_ok else int(have)
 
     if not ref:
         return {"action": "ERROR", "desc": desc,
@@ -547,7 +697,7 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
     # DAY" cannot work because nothing rejects. Evidence, or DAY.
     tif = "DAY"
     tif_note = None
-    if mkt.get("rth_open") is False and mkt.get("extended_session") is True:
+    if rth is False and ext == "overnight":
         tif = "OND"
         tif_note = ("This instrument's regular session is closed, but it is trading "
                     "in an extended session right now. The order is set to carry "
@@ -557,9 +707,27 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
                     "offer an 'outside regular trading hours' option - this tool "
                     "cannot set it. You do not have to do anything: if it is not "
                     "enabled the order simply waits for the regular session to open.")
-    elif mkt.get("rth_open") is False:
-        tif_note = ("This instrument's regular session is closed. The order is "
-                    "prepared to work when it opens.")
+    elif rth is False and ext == "prepost":
+        tif_note = (f"{market} is outside its regular session, but your broker also "
+                    "trades this instrument before and after it. The order is prepared "
+                    "now. If you tick 'outside regular trading hours' (outside RTH) "
+                    "when you approve it in your broker's app, it can execute in that "
+                    "pre- or after-hours trading instead of waiting for the open - "
+                    "this tool cannot set that option. If you do not, nothing is "
+                    "lost: the order waits for the regular session to open.")
+    if residue:
+        if rth is None:
+            tail = (f"This closes the position in whole units; the remaining "
+                    f"{residue:g} can only be sold as a fractional order in regular "
+                    "trading hours, and this tool does not know the hours of "
+                    f"{market or 'this exchange'}. Sell it in your broker's app.")
+        else:
+            tail = (f"This closes the position in whole units now; the remaining "
+                    f"{residue:g} can only be sold as a fractional order, which the "
+                    "broker accepts during regular trading hours only. The first "
+                    f"scheduled check inside {market} hours will sell it. Nothing to do "
+                    "on your side.")
+        tif_note = ((tif_note + " ") if tif_note else "") + tail
 
     return {
         "action": action,
@@ -573,8 +741,13 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None):
         "limit_price": limit,
         "time_in_force": tif,
         "time_in_force_note": tif_note,
-        "rth_open": mkt.get("rth_open"),
-        "extended_session": mkt.get("extended_session"),
+        "full_close": bool(full_close),
+        "fractional_quantity": bool(full_close and frac_ok and qty != int(qty)),
+        "residue_left_for_regular_hours": round(residue, 6) if residue else 0,
+        "market": market,
+        "rth_open_by_clock": rth,
+        "hours_source": hours_src,
+        "closed_because": None if rth else closed_why,
         "scale": round(scale, 4) if scale else None,
         "delta_pct_portafoglio": round(delta_pct, 3) if delta_pct is not None else None,
         "published_delta_pct": round(pa - pb, 3) if (pa is not None and pb is not None) else None,
@@ -629,6 +802,8 @@ def main():
                          "already working), working_age_hours. Every field is "
                          "optional and every check it feeds is skipped when absent, "
                          "so an older caller keeps working unchanged.")
+    ap.add_argument("--now", default=None,
+                    help="ISO timestamp to use as the current time (testing only).")
     ap.add_argument("--closure-grace-hours", type=float, default=96.0,
                     help="How far past its stated expiry a signal may still be acted "
                          "on when the venue has had no trading session since it was "
@@ -653,7 +828,7 @@ def main():
     if not isinstance(sig, dict) or not isinstance(sig.get("trades"), list):
         sys.exit("Signal format not recognised.")
 
-    now = datetime.now(timezone.utc)
+    now = parse_ts(a.now) if a.now else datetime.now(timezone.utc)
     results, expired, bad = [], [], []
     # Kept so the total notional of the prepared set can be stated back in the
     # account's own currency: a reader about to approve five orders should be told
@@ -713,7 +888,8 @@ def main():
             held = held_map.get(cid, 0) if held_map is not None else None
             sig_mult[cid] = t.get("multiplier") or 1
             sig_fx[cid] = t.get("fx") or 1
-            r = mirror_one(t, a.nav, price_now, held, a.min_pct, _mk)
+            r = mirror_one(t, a.nav, price_now, held, a.min_pct, _mk, now,
+                           sig.get("markets"))
             if extended:
                 r["expiry_extended_over_closure"] = True
             results.append(r)

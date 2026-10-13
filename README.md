@@ -152,15 +152,30 @@ trading prepares the order against a live price. A signal's validity is held ope
 across the closure, so a trade published on a Friday evening is still prepared when
 the market reopens.
 
-Extended-hours trading is treated as trading. Where an instrument's regular session is
-shut but it is demonstrably quoting and printing outside it, the order is prepared with
-a time in force of **OND** — overnight, carrying into the next regular session — so it
-does not expire with that evening's extended session. This is done only on live
-evidence from the broker's own quote, never from a list of venues: `OND` is accepted by
-the broker even on venues that have no overnight session, so a wrong assumption is
-caught nowhere. With no such evidence the order is a plain **DAY** order. It is never
-`GTC`, so nothing this tool prepares can sit in the market indefinitely — which matters
-because the broker connector offers no way to cancel an order once submitted.
+Regular trading hours are read off the clock: the engine compares the current time with
+each exchange's regular session in its local time, using the Market column of the
+source's register. Hours, market holidays and early closes come from the source's own
+workbook (its Markets and Market holidays sheets), so they are updated with every
+publication; a built-in table, without holidays, is used only when a workbook lacks them. It does not infer them from prices, which stay live before and
+after the session. What happens outside regular hours depends on what the source's Markets sheet says
+about each market. **OVERNIGHT** (US listings): the order is prepared at once with a time
+in force of **OND** (overnight, carrying into the next regular session). **PRE/POST**
+(e.g. Xetra, Euronext Paris): the broker trades it before and after the session only for
+orders flagged 'outside RTH', which this tool cannot set — so a DAY order is prepared, and
+the note tells the reader they may tick that box to execute early; if they don't, it waits
+for the open. **NO**: nothing is prepared until the session opens. On weekends and market
+holidays nothing is prepared for PRE/POST markets either. Every order other than OND is a
+plain **DAY** order. It is never `GTC`, so nothing this tool prepares can
+sit in the market indefinitely — which matters because the broker connector offers no way
+to cancel an order once submitted.
+
+**Closing a fractional holding.** Quantities are always whole units, with one exception:
+when the source closes a position completely, the reader's exact holding is sold,
+fraction included — but only where the register marks the instrument fractionable and
+the clock puts it inside its exchange's regular hours, since the broker accepts fractional
+orders in regular hours only. Outside regular hours the whole units are sold at once and the fraction is swept by
+the first scheduled check in regular hours. A full exit is exempt from the minimum-trade
+size, so a small residual holding is never stranded.
 
 Where the broker's app also offers an "outside regular trading hours" option, the order
 note says so, since this tool cannot set that field. Nothing depends on the reader
