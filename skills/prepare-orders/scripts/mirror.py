@@ -100,6 +100,15 @@ SLIP_BLOCK_NAV = 0.0010  # 0.10% — do not prepare the order
 # unreachable price while the source's position had already moved. At 2% the same
 # measurement is reached 90% / 56% / 98% of the time on the three names tested.
 REL_CAP = 0.02           # never allow more than 2% of price, whatever the budget
+# Currency futures move far less than shares: M6E's average daily range measured on
+# 6 October 2026 was 0.46%, so 2% is more than four ordinary days of movement. For a
+# future whose underlying is a currency the cap is 0.25% of the published price,
+# about half a day. The source's own number, 23 October 2026. "Underlying is a
+# currency" comes from the broker (see SKILL.md), passed in as underlying_is_fx.
+FX_REL_CAP = 0.0025
+# A strike in the name ("SR3Z9 C97.5") marks an option: a currency OPTION's premium
+# moves many times more than the currency itself, so the FX cap never applies to it.
+_OPTION_NAME = re.compile(r"\s[CP]\d+(?:\.\d+)?\b")
 # A generous ceiling, present only to stop a pathological cell (a pasted document,
 # a runaway formula) from flooding the agent's context. It is NOT a security control:
 # a 300-character injection works exactly as well as a 3000-character one, so a tight
@@ -630,8 +639,12 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None, now=None,
     action = ("BLOCK" if cost_nav >= SLIP_BLOCK_NAV else
               "WARN" if slip_warn else "OK")
 
+    fx_underlying = (mkt.get("underlying_is_fx") is True
+                     and "@" in str(t.get("contract_id_ex") or "")
+                     and not _OPTION_NAME.search(" " + desc0))
+    cap = FX_REL_CAP if fx_underlying else REL_CAP
     budget_tol = SLIP_BLOCK_NAV * nav * fx / (qty * mult)
-    tol = min(budget_tol, REL_CAP * abs(ref))
+    tol = min(budget_tol, cap * abs(ref))
     # Floor at one tick. On an instrument whose notional dwarfs capital - a rate
     # future published at several hundred per cent of portfolio - the cash budget
     # divided by that weight comes out below the instrument's own minimum price
@@ -768,8 +781,10 @@ def mirror_one(t, nav, price_now, held=None, min_pct=0.75, mkt=None, now=None,
         "working_qty_netted": working or 0,
         "session_open": mkt.get("session_open"),
         "tolerance_source": ("one tick (floor)" if tol_floored else
-                             "budget 0.10% of NAV" if budget_tol <= REL_CAP * abs(ref)
+                             "budget 0.10% of NAV" if budget_tol <= cap * abs(ref)
+                             else "cap 0.25% of price (currency future)" if fx_underlying
                              else "cap 2% of price"),
+        "underlying_is_fx": fx_underlying,
         "held_before": held,
         "adjustment_note": note,
         "delay_cost_account_ccy": round(cost, 2),
@@ -911,8 +926,15 @@ def main():
     # instructions - until the rest fit.
     unfunded = []
     if a.available_funds is not None:
+        # Derivatives (identifier "id@EXCHANGE": futures and options) are left to the
+        # broker. A future needs only margin, not its notional - comparing 1 M6E's
+        # ~12,000 of notional with the cash available refused a trade the account
+        # could easily margin. An option's premium is checked by the broker too.
+        # IBKR refuses the order at approval if the account cannot carry it, and
+        # nothing executes.
         buys = [r for r in results
-                if r["action"] in ("OK", "WARN") and r.get("side") == "BUY"]
+                if r["action"] in ("OK", "WARN") and r.get("side") == "BUY"
+                and "@" not in str(r.get("contract_id_ex") or "")]
         total = sum(_notional(r) for r in buys)
         for r in sorted(buys, key=_notional, reverse=True):
             if total <= a.available_funds:

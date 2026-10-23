@@ -9,7 +9,7 @@ description: >
   ordini", "controlla la fonte", "aggiorna il portafoglio", "¿hay operaciones
   nuevas?", "gibt es neue Trades?" — and on a scheduled check.
 metadata:
-  version: "2.6.0"
+  version: "2.7.0"
 ---
 
 # Prepare orders
@@ -78,7 +78,7 @@ it came from, and ask what they want to do.
 
 **State the version when you first act in a session.** This plugin is installed from
 a file and has no update channel, so a user can be running an old build without any
-sign of it. Say "order-sizer 2.6.0" once, early. A tester comparing notes needs to
+sign of it. Say "order-sizer 2.7.0" once, early. A tester comparing notes needs to
 know which build produced them.
 
 **Time in force is DAY, or OND where the engine says so. Never GTC, never anything
@@ -324,6 +324,10 @@ skipping the cleanup on a quiet day is exactly when the stale instruction surviv
   approves every order without reading and a levered portfolio they never chose.
 - `get_account_positions` → current holdings **and each holding's `market_value`**
 - `get_account_orders` → orders already working at the broker
+- `search_contracts` for each signalled contract whose identifier contains `@`
+  (futures and options), with the signal's `ticker` as the query — or, if it is
+  empty, the first word of `desc` → whether the **underlying is a currency** (see
+  `underlying_is_fx` below)
 - `get_price_snapshot` for each signalled contract, requesting at least
   `["last", "bid_ask"]` → the current price **and `last.is_close`**
 - `get_price_history` for each signalled contract, `step=ONE_DAY`,
@@ -390,6 +394,15 @@ is known for each contract:
   `get_account_orders` (`remaining_shares_qty`, positive for BUY, negative for
   SELL). `working_age_hours` from `order_time`.
 - `sessions_since_publication` — as counted above.
+- `underlying_is_fx` — `true` only for a **future** whose underlying is a currency,
+  read from the `search_contracts` row whose `symbol` matches the ticker exactly:
+  that row has a `CASH` section (the standard currency futures, e.g. symbol `EUR`),
+  or its `description` names a currency pair (the micro currency futures: `M6E`
+  "EMicro EUR USD", `MJY` "EMicro JPY USD", `M6B` "EMicro GBP USD" — checked on
+  IBKR 23 October 2026). Leave it out for everything else, and **never set it for
+  an option**: an option's premium moves many times more than the currency. Bitcoin,
+  ether, rates, indices and dividends are not currencies. The engine then caps the
+  limit at 0.25% of the published price instead of 2%.
 
 Every field is optional and every check it feeds is simply skipped when the field is
 missing. An older caller that passes no `market.json` behaves exactly as before.
@@ -419,7 +432,8 @@ each trade: side, quantity, limit price, an `action` of OK / WARN / BLOCK / SKIP
 and the cost the delay has already incurred.
 
 **How the limit is set.** The tolerance added to the published price is the tighter
-of 0.10% of the reader's NAV and 2% of the instrument's price, floored at one tick.
+of 0.10% of the reader's NAV and 2% of the instrument's price — **0.25% for a future
+whose underlying is a currency** — floored at one tick.
 The same 0.10% is the point at which the engine stops preparing because the market
 has already run too far. Both numbers were widened or tightened on 6 October 2026
 from 0.30% of NAV and 0.5% of price: measured against three months of daily bars,
@@ -502,7 +516,11 @@ these happened:
   currency in the source's instrument table looks wrong, so any quantity computed
   from it would be wrong by the same factor, and that nothing was prepared.
 - **the account cannot fund it.** Report the figure the broker gave and what the
-  order would cost. Never present this as a reason to use margin.
+  order would cost. Never present this as a reason to use margin. This check applies
+  to **shares only**. Futures and options (identifier `id@EXCHANGE`) are never
+  refused for funds by this tool: a future needs only margin, not its notional, and
+  the broker checks margin — and an option's premium — itself when the order is
+  approved. If the account cannot carry it, IBKR refuses it and nothing executes.
 
 For SKIP, create nothing, and again take the reason from the message:
 

@@ -131,7 +131,8 @@ calculation. Any residual difference is reported, never hidden, both in percenta
 points of the portfolio and as a proportion of the position.
 
 **The limit price.** Set at the tighter of two bounds — a budget of 0.10% of the
-portfolio and a cap of 2% of the price — and then floored at one tick. The budget
+portfolio and a cap of 2% of the price (0.25% for a future whose underlying is a
+currency, as reported by the broker) — and then floored at one tick. The budget
 alone is not sufficient: dividing a fixed cash budget by position size would grant a
 small position an enormous allowed price move. The cap alone is not sufficient
 either: on an instrument whose notional dwarfs capital the budget is what binds, and
@@ -168,6 +169,11 @@ holidays nothing is prepared for PRE/POST markets either. Every order other than
 plain **DAY** order. It is never `GTC`, so nothing this tool prepares can
 sit in the market indefinitely — which matters because the broker connector offers no way
 to cancel an order once submitted.
+
+**Funds.** Share purchases are checked against the funds the broker reports as
+available. Futures and options are not: a future needs only margin, not its notional,
+and the broker checks margin — and an option's premium — when the order is approved,
+refusing it if the account cannot carry it.
 
 **Closing a fractional holding.** Quantities are always whole units, with one exception:
 when the source closes a position completely, the reader's exact holding is sold,
