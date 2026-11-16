@@ -43,7 +43,7 @@ Three Python files and a skill file, for use with an AI assistant.
 
 | File | What it does |
 |---|---|
-| `fetch_source.py` | Retrieves a file from a local path or from a git repository the user configures. Decrypts it if the user supplies a key. |
+| `fetch_source.py` | Retrieves a file from a local path or from a git repository the user configures. Decrypts it if the user supplies a key — whether the source gives every reader the same key or a different one to each, which it works out from the repository itself. |
 | `read_sheet.py` | Reads instrument, weight and price from that spreadsheet. |
 | `mirror.py` | Computes the quantity, the rounding and a limit price. |
 | `drift.py` | Compares what the user holds with the book the source published, and prints the differences. Prepares nothing. |

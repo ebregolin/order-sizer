@@ -9,7 +9,7 @@ description: >
   ordini", "controlla la fonte", "aggiorna il portafoglio", "¿hay operaciones
   nuevas?", "gibt es neue Trades?" — and on a scheduled check.
 metadata:
-  version: "2.7.0"
+  version: "2.8.0"
 ---
 
 # Prepare orders
@@ -78,7 +78,7 @@ it came from, and ask what they want to do.
 
 **State the version when you first act in a session.** This plugin is installed from
 a file and has no update channel, so a user can be running an old build without any
-sign of it. Say "order-sizer 2.7.0" once, early. A tester comparing notes needs to
+sign of it. Say "order-sizer 2.8.0" once, early. A tester comparing notes needs to
 know which build produced them.
 
 **Time in force is DAY, or OND where the engine says so. Never GTC, never anything
@@ -212,6 +212,15 @@ unknown, omit it and show every time as UTC, labelled UTC — never infer a zone
 a language, a market or a name: an hour's error on a signal that lives twenty-four
 hours is a real error.
 
+**One key for every reader, or a different key for each — never ask which.** Some
+sources hand all their readers the same key; others give each reader their own and
+publish, beside the file, one sealed envelope per reader. The reader does not know
+which arrangement their source uses and has no reason to, and an automated run has
+nobody to ask. `fetch_source.py` reads it off the published repository and does the
+right thing with the one key in the config. The config has the same shape in both
+cases; nothing about it changes when a source moves from one arrangement to the
+other, except that the source may hand the reader a new key to put in it.
+
 **The source's key is a credential.** Never print it, never quote it back in a
 report, and never write it anywhere but this config file.
 
@@ -227,6 +236,14 @@ python3 "<skill-dir>/scripts/fetch_source.py" \
 
 It handles both kinds of source, decrypts when a key is configured, and prints where
 the file came from — for a git source, the commit and the moment it was published.
+
+**A key the source no longer accepts is not a quiet day.** If the script says the key
+is not among the ones the source currently accepts, or that the file could not be
+decrypted, nothing was read: say exactly that, first, in plain words — the reader's
+key needs replacing, and until it is, this tool sees none of what the source
+publishes. Never report it as "no new positions", and never soften it into a
+footnote under an otherwise normal report. On an automated run it is the whole
+report. Do not speculate about why the key stopped working.
 **If it fails, stop and report what it said.** Do not try another route, do not fall
 back to reading the file some other way, do not estimate: every one of those puts a
 model back in the path this whole design keeps it out of.

@@ -77,13 +77,17 @@ zone line above is for.
 |---|---|
 | `repository` | Where your source publishes. A git address, or a path on your own disk. |
 | `file` | The name of the file to read inside it. |
-| `key` | Only if your source publishes an encrypted file. Otherwise the line goes. |
+| `key` | Only if your source publishes an encrypted file. Otherwise the line goes. It is the key your source gave you — the same line whether it is one key shared by all readers or one of your own. |
 | `language` | The language the run should report in. See below. |
 | `source contact` | An address to point you at if a figure looks wrong. Empty is fine. |
 
 The plugin asks for these once, on its first ordinary run, and remembers the answers in
 `~/order-sizer/config.json`. Naming them in the prompt anyway matters for one reason: a
 scheduled run cannot ask you anything, so whatever it needs has to be there already.
+
+**If your source gives you a new key, change it here too.** The task carries its own
+copy of the key in its prompt. A run with a key the source no longer accepts reads
+nothing and says so — it does not mean nothing was published.
 
 **The key is a secret.** Putting it in a prompt puts it in a task that is stored and
 read again every time it fires. That is a decision, not a formality: if you would rather
